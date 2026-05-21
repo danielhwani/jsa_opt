@@ -3,6 +3,6 @@ docker run \
 	--rm \
 	--gpus all \
 	-v ${PWD}:/workspace \
-	--shm-size=8G \
+	--shm-size=32G \
 	-it joint_sa;
 	
