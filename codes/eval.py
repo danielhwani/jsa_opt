@@ -252,13 +252,28 @@ def eval_test(net, test_loader, epoch):
             x = color_noisy.to(device)
             y = aux_features.to(device)
 
-        torch.cuda.synchronize()
-        start_time = time.time()
-        with torch.no_grad():
-            # out = net(input_tensor)
-            out = net(x, y)
+        # old
+        # torch.cuda.synchronize()
+        # start_time = time.time()
+        # with torch.no_grad():
+        #     out = net(x, y)
+        # torch.cuda.synchronize()
+        # end_time = time.time() - start_time
 
-        end_time = time.time() - start_time        
+        # new
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        torch.cuda.synchronize(device)
+
+        with torch.no_grad():
+            start_event.record()
+            out = net(x, y)
+            end_event.record()
+
+        end_event.synchronize()
+        end_time = start_event.elapsed_time(end_event) * 1e-3  # seconds
+
         time_average += end_time
         out = out[:,:,:h,:w]
         loss = torch.mean(L.RelL2(out, color_gt_for_loss))

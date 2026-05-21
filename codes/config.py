@@ -52,6 +52,9 @@ config["train_input"] = 'input'
 config["train_target"] = 'target'
 
 
+# =======================================
+# Dataset
+# =======================================
 config["testDatasetDirectory"] = "../data/__test_scenes__/example"
 
 config["test_input"] = 'input' 

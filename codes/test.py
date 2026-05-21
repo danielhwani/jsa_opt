@@ -88,7 +88,7 @@ def main():
     for path in pathes:
         if path.endswith('.npz'):
             file_list.append(path)
-
+    print('path dataset: {}, num of npz files: {}'.format(path_dataset, len(file_list)))
     # if there are no npz file for train/test, convert img to npz
     if not (len(file_list) > 0):        
         print('check data set dir: {}'.format(path_train_npz))
@@ -136,22 +136,25 @@ def main():
     '''
     print("Testing Start")
     # evaluate network
-    Loss_average, PSNR_average = eval.eval_test(net, test_loader, test_epoch)
+    
+    for i in range(20):
+        Loss_average, PSNR_average = eval.eval_test(net, test_loader, test_epoch)
 
-    # log eval info of average value
-    if config['timezone'] == None:
-        str_data_eval = datetime.datetime.now().astimezone(None).strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        str_data_eval = datetime.datetime.now().astimezone(timezone(config["timezone"])).strftime("%Y-%m-%d %H:%M:%S")
-    if type(test_epoch) is str: 
-        str_print_evalutation = "[Epoch %s / %s] (%s) Loss avg: %0.6f   PSNR avg: %0.6f\n" %(test_epoch, test_epoch, str_data_eval, Loss_average, PSNR_average)
-    elif type(test_epoch) is int:
-        str_print_evalutation = "[Epoch %03d / %03d] (%s) Loss avg: %0.6f   PSNR avg: %0.6f\n" %(test_epoch, test_epoch, str_data_eval, Loss_average, PSNR_average)
+        # log eval info of average value
+        if config['timezone'] == None:
+            str_data_eval = datetime.datetime.now().astimezone(None).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            str_data_eval = datetime.datetime.now().astimezone(timezone(config["timezone"])).strftime("%Y-%m-%d %H:%M:%S")
+        if type(test_epoch) is str: 
+            str_print_evalutation = "[Epoch %s / %s] (%s) Loss avg: %0.6f   PSNR avg: %0.6f\n" %(test_epoch, test_epoch, str_data_eval, Loss_average, PSNR_average)
+        elif type(test_epoch) is int:
+            str_print_evalutation = "[Epoch %03d / %03d] (%s) Loss avg: %0.6f   PSNR avg: %0.6f\n" %(test_epoch, test_epoch, str_data_eval, Loss_average, PSNR_average)
 
-    print(str_print_evalutation)
-    logfile_validation.write(str_print_evalutation)
-    logfile_validation.flush()
+        print(str_print_evalutation)
+        logfile_validation.write(str_print_evalutation)
+        logfile_validation.flush()
     print("Testing Done")
+
 
 
 
