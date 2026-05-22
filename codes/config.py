@@ -76,7 +76,12 @@ config["f_dim"] = 7
             # aux_features = 0:2 - albedo  3 ch                           
                             # 3:5 - normal 3 ch
                             # 6 - depth    1 ch
-
+                            
+config["model_type"] = "JSA_highres"
+                    # "JSA_highres" - baseline JSA trained with high-res data
+                    # "JSA_lowres" - baseline JSA trained with low-res data
+                    # "JCA_DSR" - DSR model with low-res input and high-res aux features
+                    # "JCA_DSR_RR" - DSR model with partial high-res computations
 # =======================================
 # Training parameter
 # =======================================
