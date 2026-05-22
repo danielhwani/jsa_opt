@@ -442,7 +442,7 @@ def compile_trt_ts(
         enabled_precisions=enabled_precisions,
         require_full_compilation=require_full_compilation,
         truncate_long_and_double=True,
-        workspace_size=2 << 30,
+        workspace_size=8 << 30,
         min_block_size=1,
     )
     if calibrator is not None:

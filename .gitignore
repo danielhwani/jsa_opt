@@ -1,2 +1,5 @@
 data/*
 codes/__pycache__
+profiles/*
+scene/*
+*.exr

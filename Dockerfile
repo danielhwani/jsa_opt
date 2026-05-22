@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install -y \
     git \
     cmake && \
     rm -rf /var/lib/apt/lists/*
+RUN pip install mitsuba
 RUN echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
 ARG USER_ID=1000
