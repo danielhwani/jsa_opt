@@ -77,11 +77,12 @@ config["f_dim"] = 7
                             # 3:5 - normal 3 ch
                             # 6 - depth    1 ch
                             
-config["model_type"] = "JSA_highres"
-                    # "JSA_highres" - baseline JSA trained with high-res data
-                    # "JSA_lowres" - baseline JSA trained with low-res data
-                    # "JCA_DSR" - DSR model with low-res input and high-res aux features
-                    # "JCA_DSR_RR" - DSR model with partial high-res computations
+# config["model_type"] = "JSA_highres"
+#                     # "JSA_highres" - baseline JSA trained with high-res data
+#                     # "JSA_lowres" - baseline JSA trained with low-res data
+#                     # "JCA_DSR" - DSR model with low-res input and high-res aux features
+#                     # "JCA_DSR_RR" - DSR model with partial high-res computations
+#                     # "JCA_DSR_RR_biased" - DSR model with partial high-res computations without RR compensation
 # =======================================
 # Training parameter
 # =======================================
