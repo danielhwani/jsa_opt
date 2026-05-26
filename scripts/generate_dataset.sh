@@ -1,0 +1,24 @@
+python codes/generate_dataset.py \
+  --scene classroom/classroom.xml \
+  --name classroom_overfit_jsa_1280 \
+  --out-data data \
+  --variant cuda_ad_rgb \
+  --width 1280 --height 1280 \
+  --num-views 4 \
+  --input-spp 1 \
+  --aov-spp 1 \
+  --ref-spp 32768 \
+  --ref-chunk-spp 512 \
+  --camera-mode fixed \
+  --base-origin -1.69049 1.27158 5.88653 \
+  --base-target -1.539196 1.2998871 4.898447 \
+  --base-up -0.00428443 0.999599 0.027981 \
+  --base-fov 60 \
+  --max-depth 17 \
+  --origin-jitter 0.03 \
+  --target-jitter 0.03 \
+  --max-depth 17 \
+  --rr-depth 5 \
+  --overwrite \
+  --write-npz \
+  --seed 1234

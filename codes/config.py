@@ -45,8 +45,8 @@ config["dataloader_numworker"] = 8
 # =======================================
 # Dataset
 # =======================================
-config["DataDirectory"] = "../data"
-config["trainDatasetDirectory"] = "../data/__train_scenes__/example"
+config["DataDirectory"] = "/workspace/data"
+config["trainDatasetDirectory"] = "/workspace/data/__train_scenes__/classroom_overfit_jsa_1280"
 
 config["train_input"] = 'input'
 config["train_target"] = 'target'
@@ -55,7 +55,7 @@ config["train_target"] = 'target'
 # =======================================
 # Dataset
 # =======================================
-config["testDatasetDirectory"] = "../data/__test_scenes__/example"
+config["testDatasetDirectory"] = "/workspace/data/__test_scenes__/classroom_overfit_jsa_1280"
 
 config["test_input"] = 'input' 
 config["test_target"] = 'target'
@@ -63,7 +63,7 @@ config["test_target"] = 'target'
 # =======================================
 # Task
 # =======================================
-config["task"] = 'jsa_pretrained'
+config["task"] = 'jsa_classroom_overfit' # folder name to contain training results
 # config["task"] = 'jsa_trained' # folder name to contain training results
 
 # =======================================
@@ -86,26 +86,26 @@ config["f_dim"] = 7
 # =======================================
 # Training parameter
 # =======================================
-config["data_dir"] = "../data"
+config["data_dir"] = "/workspace/data"
 config["manual_seed"] = None
 
 config["optimizer"] = "adamw"               # optimizer for training
 config["lr_initial"] = 0.0002 # 2e-4        # initial learning rate 
-config["weight_decay"] = 0.02               # weight decay
+config["weight_decay"] = 0.001               # weight decay
 config["wramup"] = True
 config["warmup_epochs"] = 3
 
 config["patch_size"] = 128                                  
 config["patch_stride_size"] = config["patch_size"]   # default           
 config["patch_based_learning"] = True
-config["batch_size"] = 16                   # adjust to GPU memory size 
+config["batch_size"] = 1                   # adjust to GPU memory size 
 
 config["shuffle_file_list"] = True                      
 config["dataloader_shuffle"] = True
-config["aug_mode"] = True                                   
+config["aug_mode"] = False # to see overfitting, set False                                   
 
-config["max_epoch"] = 6000                  # the max epoch for training
-config["snapshot"] = 50 
+config["max_epoch"] = 2000                  # the max epoch for training
+config["snapshot"] = 100 
 
 # config["retrain"] = True
 config["retrain"] = False
