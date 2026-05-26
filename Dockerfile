@@ -46,6 +46,12 @@ RUN apt-get update && apt-get install -y \
     cmake && \
     rm -rf /var/lib/apt/lists/*
 RUN pip install mitsuba
+RUN apt-get update && apt-get install -y sudo
+WORKDIR /tmp
+RUN wget https://github.com/OpenImageDenoise/oidn/releases/download/v2.4.1/oidn-2.4.1.x86_64.linux.tar.gz
+RUN tar -xzf oidn-2.4.1.x86_64.linux.tar.gz
+env OIDN_DIR=/tmp/oidn-2.4.1.x86_64.linux
+
 RUN echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
 ARG USER_ID=1000

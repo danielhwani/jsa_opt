@@ -124,21 +124,17 @@ def main():
     # Step3 - Define Network
     # =======================================
     '''
-    #  U-shaped joint self-attention & simple mlp (Original)
-    
-    # net = model_joint_sa.JSA_transformer(img_size=config["patch_size"],
-    #                                 embedded_dim=config["embed_dim"],
-    #                                 win_size=8,
-    #                                 projection_option='linear',
-    #                                 ffn_option='mlp',
-    #                                 depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
-    #                                 in_x=config["x_dim"],
-    #                                 in_f=config["f_dim"]
-    #                                 )  
-    
-    # optimized for TensorRT int8 quantization
-    net = model_joint_sa_v2_int8.JSA_transformer(image_size=
-    
+    #  U-shaped joint self-attention & simple mlp
+    net = model_joint_sa.JSA_transformer(img_size=config["patch_size"],
+                                    embedded_dim=config["embed_dim"],
+                                    win_size=8,
+                                    projection_option='linear',
+                                    ffn_option='mlp',
+                                    depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
+                                    in_x=config["x_dim"],
+                                    in_f=config["f_dim"]
+                                    )  
+        
     # setting for multi gpu
     if config["multi_gpu"]:
         net = torch.nn.DataParallel(net)

@@ -1,46 +1,44 @@
 #!/usr/bin/env python3
 """
-Generate a scene-specific multi-view dataset with Mitsuba 3 and write separate EXR files.
+Render an over-fit dataset for the original JSA repository from Mitsuba 3.
 
-For each randomized camera view, this script writes a directory:
+Default output is the original EXR directory scheme expected by preprocess.py:
 
-  <out>/<split>/<index>/
-    low_rgb.exr       # low-resolution noisy/path-traced color, e.g. 640x360 @ 1 spp
-    low_aov.exr       # low-resolution G-buffer/AOV channels, multi-channel EXR
-    high_rgb.exr      # original-resolution noisy/path-traced color, for OIDN or SR baseline
-    high_aov.exr      # original-resolution G-buffer/AOV channels, multi-channel EXR
-    ref_rgb.exr       # original-resolution high-spp reference color
-    camera.json       # camera parameters and render settings
+  <out_data>/__train_scenes__/<name>/input/*.exr
+  <out_data>/__train_scenes__/<name>/target/*.exr
+  <out_data>/__test_scenes__/<name>/input/*.exr
+  <out_data>/__test_scenes__/<name>/target/*.exr
 
-Optional:
-    --split-aovs also writes low_<name>.exr / high_<name>.exr for known AOVs.
-    --write-npz additionally writes a compressed view.npz for debugging/backward compatibility.
+The original train/test code will create:
+  input_npz/
+  target_npz/
+automatically if they do not exist.
 
-Typical use for FHD target with 3x low-res inference:
+Use --write-npz if you also want to write the NPZ files immediately for sharing/debugging.
 
-  python mi3_multiview_exr_dataset.py \
-    --scene scene.xml --out data_scene \
-    --high-w 1920 --high-h 1080 --down 3 \
-    --num-train 256 --num-val 32 --num-test 32 \
-    --low-spp 1 --gbuf-spp 1 --high-rgb-spp 1 --ref-spp 256 \
-    --center 0 1 0 --radius-min 2.5 --radius-max 5.0 \
-    --height-min 0.7 --height-max 2.0 --split-aovs
+Input EXR layers:
+  default : noisy RGB
+  albedo  : albedo RGB
+  normal  : shading normal RGB, raw [-1,1] convention
+  depth   : normalized depth, 1 channel
 
-Notes:
-  - Requires: pip install mitsuba numpy pyexr
-  - Use --variant cuda_ad_rgb for GPU rendering.
-  - Random orbit cameras are only a starting point. For indoor scenes, pass conservative
-    center/radius/height ranges or replace sample_camera() with your valid camera path sampler.
+Target EXR layers:
+  default : high-spp reference RGB
+
+The same rendered views are copied to both train and test by default, so this is
+an intentional over-fit benchmark dataset.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-from dataclasses import dataclass, asdict
 import math
+import shutil
 import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 
@@ -55,201 +53,195 @@ def fmt_seconds(seconds: float) -> str:
     return f"{minutes / 60.0:.2f}h"
 
 
-
 @dataclass
 class CameraSample:
-    origin: tuple[float, float, float]
-    target: tuple[float, float, float]
-    up: tuple[float, float, float]
+    origin: Tuple[float, float, float]
+    target: Tuple[float, float, float]
+    up: Tuple[float, float, float]
     fov: float
 
 
-def sample_camera(rng: np.random.Generator, args) -> CameraSample:
-    """Simple orbit-style random camera sampler. Edit this for scene-specific valid paths."""
-    center = np.asarray(args.center, dtype=np.float32)
+def sanitize_rgb(x: np.ndarray) -> np.ndarray:
+    x = np.nan_to_num(x.astype(np.float32), nan=0.0, posinf=1e10, neginf=0.0)
+    return np.clip(x, 0.0, np.max(x) if x.size else 0.0).astype(np.float32)
 
+
+def normalize_depth_np(depth: np.ndarray) -> np.ndarray:
+    d = np.nan_to_num(depth.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    d = np.clip(d, 0.0, np.max(d) if d.size else 0.0)
+    mx = float(np.max(d)) if d.size else 0.0
+    if mx > 0.0:
+        d = d / mx
+    return d.astype(np.float32)
+
+
+def split_aov(aov: np.ndarray):
+    """
+    Mitsuba AOV order used by this script:
+      albedo:albedo,depth:depth,sh_normal:sh_normal
+
+    aov layout:
+      0:3  albedo
+      3:4  depth
+      4:7  shading normal
+    """
+    if aov.shape[-1] < 7:
+        raise ValueError(f"Expected at least 7 AOV channels, got shape={aov.shape}")
+    albedo = np.nan_to_num(aov[..., 0:3].astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    albedo = np.clip(albedo, 0.0, 1.0)
+    depth = normalize_depth_np(aov[..., 3:4])
+    normal = np.nan_to_num(aov[..., 4:7].astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    normal = np.clip(normal, -1.0, 1.0)
+    return albedo, normal, depth
+
+
+def write_layered_exr(path: Path, layers: dict[str, np.ndarray]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import pyexr
+    clean = {}
+    for k, v in layers.items():
+        a = np.asarray(v, dtype=np.float32)
+        if a.ndim == 2:
+            a = a[..., None]
+        clean[k] = np.nan_to_num(a, nan=0.0, posinf=1e10, neginf=-1e10)
+    pyexr.write(str(path), clean)
+
+
+def write_npz_pair(base_root: Path, split: str, stem: str,
+                   color: np.ndarray, albedo: np.ndarray, normal: np.ndarray, depth: np.ndarray, ref: np.ndarray):
+    input_npz = base_root / split / "input_npz"
+    target_npz = base_root / split / "target_npz"
+    input_npz.mkdir(parents=True, exist_ok=True)
+    target_npz.mkdir(parents=True, exist_ok=True)
+    aux = np.concatenate([albedo, normal, depth], axis=-1).astype(np.float32)
+    np.savez_compressed(input_npz / f"{stem}.npz", color=color.astype(np.float32), aux=aux)
+    np.savez_compressed(target_npz / f"{stem}.npz", color=ref.astype(np.float32))
+
+
+def sample_fixed_camera(rng: np.random.Generator, args) -> CameraSample:
+    origin = np.asarray(args.base_origin, dtype=np.float32)
+    target = np.asarray(args.base_target, dtype=np.float32)
+    up = np.asarray(args.base_up, dtype=np.float32)
+    if args.origin_jitter > 0:
+        origin = origin + rng.normal(0.0, args.origin_jitter, size=3).astype(np.float32)
+    if args.target_jitter > 0:
+        target = target + rng.normal(0.0, args.target_jitter, size=3).astype(np.float32)
+    return CameraSample(tuple(map(float, origin)), tuple(map(float, target)), tuple(map(float, up)), float(args.base_fov))
+
+
+def sample_orbit_camera(rng: np.random.Generator, args) -> CameraSample:
+    center = np.asarray(args.center, dtype=np.float32)
     theta = rng.uniform(args.theta_min, args.theta_max) * math.pi / 180.0
     radius = rng.uniform(args.radius_min, args.radius_max)
     height = rng.uniform(args.height_min, args.height_max)
-
-    target_jitter = rng.normal(0.0, args.target_jitter, size=3).astype(np.float32)
-    target_jitter[1] *= 0.5
-    target = center + target_jitter
-
+    target = center + rng.normal(0.0, args.target_jitter, size=3).astype(np.float32)
+    target[1] = center[1] + (target[1] - center[1]) * 0.5
     origin = np.array([
         center[0] + radius * math.cos(theta),
         height,
         center[2] + radius * math.sin(theta),
     ], dtype=np.float32)
     origin += rng.normal(0.0, args.origin_jitter, size=3).astype(np.float32)
-
-    return CameraSample(
-        origin=tuple(float(x) for x in origin),
-        target=tuple(float(x) for x in target),
-        up=(0.0, 1.0, 0.0),
-        fov=float(rng.uniform(args.fov_min, args.fov_max)),
-    )
-
-
-# Conservative channel-count map for common Mitsuba AOVs.
-# Unknown AOVs are not split, but remain in low_aov.exr/high_aov.exr.
-AOV_CHANNEL_COUNTS = {
-    "albedo": 3,
-    "depth": 1,
-    "position": 3,
-    "geo_normal": 3,
-    "sh_normal": 3,
-    "normal": 3,
-    "uv": 2,
-    "primitive_index": 1,
-    "shape_index": 1,
-}
-
-
-def parse_aov_specs(aovs: str):
-    """Parse 'name:type,name2:type2' into [(name, type, nchannels_or_None), ...]."""
-    specs = []
-    for part in [p.strip() for p in aovs.split(',') if p.strip()]:
-        if ':' in part:
-            name, typ = part.split(':', 1)
-        else:
-            name, typ = part, part
-        name, typ = name.strip(), typ.strip()
-        n = AOV_CHANNEL_COUNTS.get(typ, AOV_CHANNEL_COUNTS.get(name))
-        specs.append((name, typ, n))
-    return specs
-
-
-def write_exr(path: Path, arr: np.ndarray):
-    """Write HxWxC or HxW float32 array to EXR."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim == 2:
-        arr = arr[..., None]
-    # Avoid NaNs/Infs poisoning training or OIDN tests.
-    arr = np.nan_to_num(arr, nan=0.0, posinf=1e10, neginf=-1e10)
-    try:
-        import pyexr
-        pyexr.write(str(path), arr)
-    except Exception:
-        # Fallback to Mitsuba Bitmap writer. This may not preserve channel names,
-        # but keeps the data in EXR format.
-        import mitsuba as mi
-        mi.Bitmap(arr).write(str(path))
-
-
-def save_split_aovs(view_dir: Path, prefix: str, aov: np.ndarray, specs):
-    """Write per-AOV EXR files when channel counts are known."""
-    offset = 0
-    for name, typ, n in specs:
-        if n is None:
-            continue
-        if offset + n > aov.shape[-1]:
-            print(f"[warn] cannot split AOV '{name}', expected {n} channels at offset {offset}, total={aov.shape[-1]}")
-            break
-        write_exr(view_dir / f"{prefix}_{name}.exr", aov[..., offset:offset + n])
-        offset += n
+    fov = rng.uniform(args.fov_min, args.fov_max)
+    return CameraSample(tuple(map(float, origin)), tuple(map(float, target)), (0.0, 1.0, 0.0), float(fov))
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", required=True, help="Mitsuba XML scene path")
-    ap.add_argument("--out", required=True, help="Output directory")
-    ap.add_argument("--variant", default="cuda_ad_rgb", help="Mitsuba variant, e.g. cuda_ad_rgb or scalar_rgb")
-
-    ap.add_argument("--high-w", type=int, default=1920)
-    ap.add_argument("--high-h", type=int, default=1080)
-    ap.add_argument("--down", type=int, default=3)
-    ap.add_argument("--low-spp", type=int, default=1)
-    ap.add_argument("--gbuf-spp", type=int, default=1, help="SPP for AOV/G-buffer renders")
-    ap.add_argument("--high-rgb-spp", type=int, default=None,
-                    help="SPP for high_rgb.exr. Defaults to --low-spp. If equal to --gbuf-spp, reuses the high AOV RGB pass.")
-    ap.add_argument("--ref-spp", type=int, default=256)
-    ap.add_argument("--ref-chunk-spp", type=int, default=0,
-                    help="If >0, render ref_rgb in independent chunks of this SPP and print per-chunk ETA. Useful for long high-spp references, e.g. --ref-chunk-spp 64 for ref-spp 1024.")
-    ap.add_argument("--max-depth", type=int, default=-1)
+    ap.add_argument("--scene", required=True)
+    ap.add_argument("--name", default="overfit_jsa")
+    ap.add_argument("--out-data", default="../data")
+    ap.add_argument("--variant", default="cuda_ad_rgb")
+    ap.add_argument("--width", type=int, default=1280)
+    ap.add_argument("--height", type=int, default=1280)
+    ap.add_argument("--num-views", type=int, default=4)
+    ap.add_argument("--input-spp", type=int, default=1)
+    ap.add_argument("--aov-spp", type=int, default=1)
+    ap.add_argument("--ref-spp", type=int, default=4096)
+    ap.add_argument("--ref-chunk-spp", type=int, default=512)
+    ap.add_argument("--max-depth", type=int, default=10)
     ap.add_argument("--rr-depth", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--write-npz", action="store_true", help="Also write input_npz/target_npz immediately.")
+    ap.add_argument("--no-copy-test", action="store_true", help="Only write train split. Default writes same views to test too.")
 
-    ap.add_argument("--num-train", type=int, default=256)
-    ap.add_argument("--num-val", type=int, default=32)
-    ap.add_argument("--num-test", type=int, default=32)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--camera-mode", choices=["fixed", "orbit"], default="fixed")
+    ap.add_argument("--base-origin", nargs=3, type=float, default=(-37.4663, -0.614254, 32.1223))
+    ap.add_argument("--base-target", nargs=3, type=float, default=(-36.799804, -0.462232, 31.392456))
+    ap.add_argument("--base-up", nargs=3, type=float, default=(0.0, 1.0, 0.0))
+    ap.add_argument("--base-fov", type=float, default=35.0)
 
     ap.add_argument("--center", nargs=3, type=float, default=(0.0, 1.0, 0.0))
-    ap.add_argument("--radius-min", type=float, default=2.0)
-    ap.add_argument("--radius-max", type=float, default=5.0)
-    ap.add_argument("--height-min", type=float, default=0.7)
-    ap.add_argument("--height-max", type=float, default=2.0)
+    ap.add_argument("--radius-min", type=float, default=0.85)
+    ap.add_argument("--radius-max", type=float, default=2.0)
+    ap.add_argument("--height-min", type=float, default=-0.8)
+    ap.add_argument("--height-max", type=float, default=0.8)
     ap.add_argument("--theta-min", type=float, default=0.0)
     ap.add_argument("--theta-max", type=float, default=360.0)
-    ap.add_argument("--target-jitter", type=float, default=0.15)
-    ap.add_argument("--origin-jitter", type=float, default=0.02)
-    ap.add_argument("--fov-min", type=float, default=45.0)
-    ap.add_argument("--fov-max", type=float, default=55.0)
+    ap.add_argument("--target-jitter", type=float, default=0.0)
+    ap.add_argument("--origin-jitter", type=float, default=0.0)
+    ap.add_argument("--fov-min", type=float, default=35.0)
+    ap.add_argument("--fov-max", type=float, default=35.0)
 
-    ap.add_argument(
-        "--aovs",
-        default="albedo:albedo,depth:depth,sh_normal:sh_normal,geo_normal:geo_normal,position:position",
-        help="Mitsuba AOV string. RGB image is stored in first 3 channels, AOVs after that.",
-    )
-    ap.add_argument("--split-aovs", action="store_true", help="Also write per-AOV EXR files such as high_albedo.exr.")
-    ap.add_argument("--write-npz", action="store_true", help="Additionally write view.npz for compatibility/debugging.")
-    ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
-    if args.high_rgb_spp is None:
-        args.high_rgb_spp = args.low_spp
+    if args.width % 128 != 0 or args.height % 128 != 0:
+        print(f"[warn] width/height should ideally be divisible by 128 for original JSA/TRT. Got {args.width}x{args.height}.")
+    if args.width != args.height:
+        print("[warn] original full-frame JSA has square-token assumptions. Square resolution is recommended for the first TRT benchmark.")
 
     import mitsuba as mi
     mi.set_variant(args.variant)
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for split in ("train", "val", "test"):
-        (out_dir / split).mkdir(exist_ok=True)
-
-    low_w = args.high_w // args.down
-    low_h = args.high_h // args.down
-    if args.high_w % args.down != 0 or args.high_h % args.down != 0:
-        print(f"[warn] high resolution is not divisible by down={args.down}; using integer floor low res {low_w}x{low_h}.")
-
     print(f"[Mitsuba] variant={args.variant}")
-    print(f"[Scene] loading: {args.scene}")
+    print(f"[Scene] loading {args.scene}")
     scene = mi.load_file(args.scene)
 
-    aov_specs = parse_aov_specs(args.aovs)
+    out_data = Path(args.out_data)
+    train_root = out_data / "__train_scenes__" / args.name
+    test_root = out_data / "__test_scenes__" / args.name
+
+    if args.overwrite:
+        shutil.rmtree(train_root, ignore_errors=True)
+        if not args.no_copy_test:
+            shutil.rmtree(test_root, ignore_errors=True)
+
+    for root in ([train_root] if args.no_copy_test else [train_root, test_root]):
+        (root / "input").mkdir(parents=True, exist_ok=True)
+        (root / "target").mkdir(parents=True, exist_ok=True)
+        if args.write_npz:
+            (root / "input_npz").mkdir(parents=True, exist_ok=True)
+            (root / "target_npz").mkdir(parents=True, exist_ok=True)
+
     aov_integrator = mi.load_dict({
         "type": "aov",
-        "aovs": args.aovs,
+        "aovs": "albedo:albedo,depth:depth,sh_normal:sh_normal",
         "integrator": {
             "type": "path",
-            "max_depth": args.max_depth,
-            "rr_depth": args.rr_depth,
+            "max_depth": int(args.max_depth),
+            "rr_depth": int(args.rr_depth),
         },
     })
     path_integrator = mi.load_dict({
         "type": "path",
-        "max_depth": args.max_depth,
-        "rr_depth": args.rr_depth,
+        "max_depth": int(args.max_depth),
+        "rr_depth": int(args.rr_depth),
     })
 
-    def make_sensor(cam: CameraSample, w: int, h: int, spp: int):
+    def make_sensor(cam: CameraSample, spp: int):
         return mi.load_dict({
             "type": "perspective",
-            "fov": cam.fov,
+            "fov": float(cam.fov),
             "to_world": mi.ScalarTransform4f.look_at(
                 origin=cam.origin,
                 target=cam.target,
                 up=cam.up,
             ),
-            "sampler": {
-                "type": "independent",
-                "sample_count": int(spp),
-            },
+            "sampler": {"type": "independent", "sample_count": int(spp)},
             "film": {
                 "type": "hdrfilm",
-                "width": int(w),
-                "height": int(h),
+                "width": int(args.width),
+                "height": int(args.height),
                 "rfilter": {"type": "box"},
             },
         })
@@ -257,182 +249,121 @@ def main():
     def to_np(img):
         return np.asarray(mi.Bitmap(img), dtype=np.float32)
 
-    def render_aov(cam: CameraSample, w: int, h: int, spp: int, seed: int):
-        sensor = make_sensor(cam, w, h, spp)
-        img = mi.render(scene, sensor=sensor, integrator=aov_integrator, seed=int(seed), spp=int(spp))
+    def render_aov(cam: CameraSample, seed: int):
+        sensor = make_sensor(cam, args.aov_spp)
+        img = mi.render(scene, sensor=sensor, integrator=aov_integrator, seed=int(seed), spp=int(args.aov_spp))
         arr = to_np(img)
-        return arr[..., :3], arr[..., 3:]
+        return sanitize_rgb(arr[..., :3]), arr[..., 3:]
 
-    def render_rgb(cam: CameraSample, w: int, h: int, spp: int, seed: int):
-        sensor = make_sensor(cam, w, h, spp)
+    def render_rgb(cam: CameraSample, spp: int, seed: int):
+        sensor = make_sensor(cam, spp)
         img = mi.render(scene, sensor=sensor, integrator=path_integrator, seed=int(seed), spp=int(spp))
-        return to_np(img)[..., :3]
+        return sanitize_rgb(to_np(img)[..., :3])
 
-    def timed(label: str, fn):
-        print(f"      -> {label} ...", flush=True)
-        ts = time.time()
-        out = fn()
-        dt = time.time() - ts
-        print(f"      <- {label}: {fmt_seconds(dt)}", flush=True)
-        return out, dt
+    def render_ref(cam: CameraSample, seed: int):
+        chunk = int(args.ref_chunk_spp or 0)
+        if chunk <= 0 or args.ref_spp <= chunk:
+            ts = time.time()
+            out = render_rgb(cam, args.ref_spp, seed)
+            print(f"      <- ref {args.ref_spp}spp: {fmt_seconds(time.time()-ts)}", flush=True)
+            return out
 
-    def render_rgb_ref_with_progress(cam: CameraSample, w: int, h: int, spp: int, seed: int, label: str):
-        chunk_spp = int(args.ref_chunk_spp or 0)
-        if chunk_spp <= 0 or spp <= chunk_spp:
-            return timed(label, lambda: render_rgb(cam, w, h, spp, seed))[0]
-
-        n_chunks = int(math.ceil(spp / chunk_spp))
-        print(f"      -> {label}: chunked {spp} spp as {n_chunks} chunks of <= {chunk_spp} spp", flush=True)
+        n_chunks = int(math.ceil(args.ref_spp / chunk))
         acc = None
-        done_spp = 0
-        t_phase = time.time()
+        done = 0
+        t0 = time.time()
         for ci in range(n_chunks):
-            cur_spp = min(chunk_spp, spp - done_spp)
-            t_chunk = time.time()
-            img = render_rgb(cam, w, h, cur_spp, seed + ci * 10007)
+            cur = min(chunk, args.ref_spp - done)
+            tc = time.time()
+            img = render_rgb(cam, cur, seed + 10007 * ci)
             if acc is None:
                 acc = np.zeros_like(img, dtype=np.float64)
-            acc += img.astype(np.float64) * float(cur_spp)
-            done_spp += cur_spp
-            chunk_dt = time.time() - t_chunk
-            elapsed = time.time() - t_phase
-            rate = done_spp / max(elapsed, 1e-9)
-            rem = (spp - done_spp) / max(rate, 1e-9)
-            print(
-                f"         [{ci+1:02d}/{n_chunks:02d}] {done_spp}/{spp} spp "
-                f"chunk={fmt_seconds(chunk_dt)} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(rem)}",
-                flush=True,
-            )
-        total_dt = time.time() - t_phase
-        print(f"      <- {label}: {fmt_seconds(total_dt)}", flush=True)
-        return (acc / float(spp)).astype(np.float32)
+            acc += img.astype(np.float64) * float(cur)
+            done += cur
+            elapsed = time.time() - t0
+            rate = done / max(elapsed, 1e-9)
+            eta = (args.ref_spp - done) / max(rate, 1e-9)
+            print(f"         ref chunk [{ci+1:02d}/{n_chunks:02d}] {done}/{args.ref_spp} spp "
+                  f"chunk={fmt_seconds(time.time()-tc)} elapsed={fmt_seconds(elapsed)} eta={fmt_seconds(eta)}",
+                  flush=True)
+        print(f"      <- ref total: {fmt_seconds(time.time()-t0)}", flush=True)
+        return (acc / float(args.ref_spp)).astype(np.float32)
 
-    split_counts = {"train": args.num_train, "val": args.num_val, "test": args.num_test}
     rng = np.random.default_rng(args.seed)
-    meta = {
-        "scene": str(args.scene),
+    metadata = {
+        "scene": args.scene,
         "variant": args.variant,
-        "high_w": args.high_w,
-        "high_h": args.high_h,
-        "low_w": low_w,
-        "low_h": low_h,
-        "down": args.down,
-        "low_spp": args.low_spp,
-        "gbuf_spp": args.gbuf_spp,
-        "high_rgb_spp": args.high_rgb_spp,
+        "width": args.width,
+        "height": args.height,
+        "num_views": args.num_views,
+        "input_spp": args.input_spp,
+        "aov_spp": args.aov_spp,
         "ref_spp": args.ref_spp,
-        "aovs": args.aovs,
-        "aov_specs": [{"name": n, "type": t, "channels": c} for n, t, c in aov_specs],
-        "splits": split_counts,
-        "files_per_view": ["low_rgb.exr", "low_aov.exr", "high_rgb.exr", "high_aov.exr", "ref_rgb.exr", "camera.json"],
+        "camera_mode": args.camera_mode,
+        "write_npz": args.write_npz,
+        "note": "Same views are written to train/test unless --no-copy-test is used.",
+        "cameras": [],
     }
-    (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
-    total = sum(split_counts.values())
-    global_index = 0
-    completed_count = 0
-    t0 = time.time()
-    for split, count in split_counts.items():
-        for _ in range(count):
-            stem = f"{global_index:06d}"
-            view_dir = out_dir / split / stem
-            done_flag = view_dir / "DONE"
-            if done_flag.exists() and not args.overwrite:
-                completed_count += 1
-                remaining = max(total - completed_count, 0)
-                print(f"[skip] {view_dir}  ({completed_count}/{total}, remaining={remaining})", flush=True)
-                global_index += 1
-                continue
+    roots = [train_root] if args.no_copy_test else [train_root, test_root]
 
-            view_dir.mkdir(parents=True, exist_ok=True)
-            cam = sample_camera(rng, args)
-            seed_base = args.seed * 1000003 + global_index * 17
-            item_start = time.time()
+    for i in range(args.num_views):
+        cam = sample_fixed_camera(rng, args) if args.camera_mode == "fixed" else sample_orbit_camera(rng, args)
+        print(f"[{i+1:04d}/{args.num_views:04d}] camera={cam}", flush=True)
 
-            print(
-                f"[{global_index+1:5d}/{total}] {split}/{stem}: "
-                f"low {low_w}x{low_h}@{args.low_spp}, "
-                f"high_rgb {args.high_w}x{args.high_h}@{args.high_rgb_spp}, "
-                f"high_aov@{args.gbuf_spp}, ref@{args.ref_spp}"
-            , flush=True)
+        ts = time.time()
+        rgb_from_aov, aov = render_aov(cam, args.seed + i * 17 + 1)
+        print(f"      <- input+aov {args.width}x{args.height}@{args.aov_spp}: {fmt_seconds(time.time()-ts)}", flush=True)
 
-            (low_rgb, low_aov), _ = timed(
-                f"low_aov/rgb {low_w}x{low_h}@{args.low_spp}",
-                lambda: render_aov(cam, low_w, low_h, args.low_spp, seed_base + 1),
-            )
-            (high_rgb_from_aov, high_aov), _ = timed(
-                f"high_aov/rgb {args.high_w}x{args.high_h}@{args.gbuf_spp}",
-                lambda: render_aov(cam, args.high_w, args.high_h, args.gbuf_spp, seed_base + 2),
-            )
-            if args.high_rgb_spp == args.gbuf_spp:
-                high_rgb = high_rgb_from_aov
-                print("      == high_rgb: reused RGB channels from high_aov pass", flush=True)
-            else:
-                high_rgb, _ = timed(
-                    f"high_rgb {args.high_w}x{args.high_h}@{args.high_rgb_spp}",
-                    lambda: render_rgb(cam, args.high_w, args.high_h, args.high_rgb_spp, seed_base + 4),
-                )
-            ref_rgb = render_rgb_ref_with_progress(
-                cam, args.high_w, args.high_h, args.ref_spp, seed_base + 3,
-                f"ref_rgb {args.high_w}x{args.high_h}@{args.ref_spp}",
-            )
+        if args.input_spp == args.aov_spp:
+            color = rgb_from_aov
+        else:
+            ts = time.time()
+            color = render_rgb(cam, args.input_spp, args.seed + i * 17 + 2)
+            print(f"      <- input rgb {args.width}x{args.height}@{args.input_spp}: {fmt_seconds(time.time()-ts)}", flush=True)
 
-            io_start = time.time()
-            print("      -> write EXRs ...", flush=True)
-            write_exr(view_dir / "low_rgb.exr", low_rgb)
-            write_exr(view_dir / "low_aov.exr", low_aov)
-            write_exr(view_dir / "high_rgb.exr", high_rgb)
-            write_exr(view_dir / "high_aov.exr", high_aov)
-            write_exr(view_dir / "ref_rgb.exr", ref_rgb)
+        albedo, normal, depth = split_aov(aov)
+        ref = render_ref(cam, args.seed + i * 17 + 1000)
 
-            if args.split_aovs:
-                save_split_aovs(view_dir, "low", low_aov, aov_specs)
-                save_split_aovs(view_dir, "high", high_aov, aov_specs)
+        stem = f"{args.name}_{i:04d}"
 
-            cam_meta = {
-                "index": global_index,
-                "split": split,
-                "camera": asdict(cam),
-                "seed_base": int(seed_base),
-                "low_resolution": [low_w, low_h],
-                "high_resolution": [args.high_w, args.high_h],
-                "low_spp": args.low_spp,
-                "gbuf_spp": args.gbuf_spp,
-                "high_rgb_spp": args.high_rgb_spp,
-                "ref_spp": args.ref_spp,
-            }
-            (view_dir / "camera.json").write_text(json.dumps(cam_meta, indent=2))
-
+        for root in roots:
+            write_layered_exr(root / "input" / f"{stem}.exr", {
+                "default": color,
+                "albedo": albedo,
+                "normal": normal,
+                "depth": depth,
+            })
+            write_layered_exr(root / "target" / f"{stem}.exr", {
+                "default": ref,
+            })
             if args.write_npz:
-                np.savez_compressed(
-                    view_dir / "view.npz",
-                    low_rgb=low_rgb,
-                    low_aov=low_aov,
-                    high_rgb=high_rgb,
-                    high_aov=high_aov,
-                    ref_rgb=ref_rgb,
-                    camera_origin=np.asarray(cam.origin, dtype=np.float32),
-                    camera_target=np.asarray(cam.target, dtype=np.float32),
-                    camera_up=np.asarray(cam.up, dtype=np.float32),
-                    fov=np.asarray([cam.fov], dtype=np.float32),
-                )
+                write_npz_pair(root, "", stem, color, albedo, normal, depth, ref)
 
-            done_flag.write_text("ok\n")
-            io_dt = time.time() - io_start
-            item_dt = time.time() - item_start
-            completed_count += 1
-            avg_dt = (time.time() - t0) / max(completed_count, 1)
-            remaining = max(total - completed_count, 0)
-            print(
-                f"      <- write EXRs: {fmt_seconds(io_dt)}\n"
-                f"[done] {split}/{stem}: item={fmt_seconds(item_dt)} "
-                f"avg={fmt_seconds(avg_dt)} eta_total={fmt_seconds(avg_dt * remaining)} "
-                f"({completed_count}/{total})",
-                flush=True,
-            )
-            global_index += 1
+        metadata["cameras"].append(asdict(cam))
 
-    print(f"Done. elapsed={(time.time()-t0)/60:.2f} min. Output: {out_dir}", flush=True)
+    for root in roots:
+        with open(root / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+    print("\n[done]")
+    print(f"train EXR: {train_root / 'input'}")
+    print(f"test  EXR: {test_root / 'input'}" if not args.no_copy_test else "test EXR: skipped")
+    if args.write_npz:
+        print(f"train NPZ: {train_root / 'input_npz'}")
+        if not args.no_copy_test:
+            print(f"test  NPZ: {test_root / 'input_npz'}")
+    else:
+        print("NPZ was not written. Original train/test code will create input_npz/target_npz from EXR if needed.")
+
+    print("\nConfig patch:")
+    print(f'config["task"] = "jsa_{args.name}"')
+    print(f'config["trainDatasetDirectory"] = "../data/__train_scenes__/{args.name}"')
+    print(f'config["testDatasetDirectory"] = "../data/__test_scenes__/{args.name}"')
+    print('config["train_input"] = "input"')
+    print('config["train_target"] = "target"')
+    print('config["test_input"] = "input"')
+    print('config["test_target"] = "target"')
 
 
 if __name__ == "__main__":
