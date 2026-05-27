@@ -46,7 +46,7 @@ config["dataloader_numworker"] = 8
 # Dataset
 # =======================================
 config["DataDirectory"] = "/workspace/data"
-config["trainDatasetDirectory"] = "/workspace/data/__train_scenes__/classroom_overfit_jsa_1280"
+config["trainDatasetDirectory"] = "/workspace/data/__train_scenes__/classroom_overfit_jsa_1024"
 
 config["train_input"] = 'input'
 config["train_target"] = 'target'
@@ -55,7 +55,7 @@ config["train_target"] = 'target'
 # =======================================
 # Dataset
 # =======================================
-config["testDatasetDirectory"] = "/workspace/data/__test_scenes__/classroom_overfit_jsa_1280"
+config["testDatasetDirectory"] = "/workspace/data/__test_scenes__/classroom_overfit_jsa_1024"
 
 config["test_input"] = 'input' 
 config["test_target"] = 'target'
@@ -87,13 +87,13 @@ config["f_dim"] = 7
 # Training parameter
 # =======================================
 config["data_dir"] = "/workspace/data"
-config["manual_seed"] = None
+config["manual_seed"] = 1234
 
 config["optimizer"] = "adamw"               # optimizer for training
 config["lr_initial"] = 0.0002 # 2e-4        # initial learning rate 
 config["weight_decay"] = 0.001               # weight decay
 config["wramup"] = True
-config["warmup_epochs"] = 3
+config["warmup_epochs"] = 5
 
 config["patch_size"] = 128                                  
 config["patch_stride_size"] = config["patch_size"]   # default           
@@ -104,8 +104,8 @@ config["shuffle_file_list"] = True
 config["dataloader_shuffle"] = True
 config["aug_mode"] = False # to see overfitting, set False                                   
 
-config["max_epoch"] = 2000                  # the max epoch for training
-config["snapshot"] = 100 
+config["max_epoch"] = 5000                  # the max epoch for training
+config["snapshot"] = 1000 
 
 # config["retrain"] = True
 config["retrain"] = False
@@ -114,7 +114,7 @@ config["restore_epoch"] = 50
 # =======================================
 # Test parameter
 # =======================================
-config["load_epoch"] = "5800" #'jsa_pretrained'
+config["load_epoch"] = "5000" #'jsa_pretrained'
 
 
 

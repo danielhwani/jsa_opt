@@ -45,12 +45,23 @@ RUN apt-get update && apt-get install -y \
     git \
     cmake && \
     rm -rf /var/lib/apt/lists/*
-RUN pip install mitsuba
+RUN pip install mitsuba gradio pillow imageio
 RUN apt-get update && apt-get install -y sudo
-WORKDIR /tmp
-RUN wget https://github.com/OpenImageDenoise/oidn/releases/download/v2.4.1/oidn-2.4.1.x86_64.linux.tar.gz
-RUN tar -xzf oidn-2.4.1.x86_64.linux.tar.gz
-env OIDN_DIR=/tmp/oidn-2.4.1.x86_64.linux
+
+WORKDIR /opt
+
+RUN wget https://github.com/OpenImageDenoise/oidn/releases/download/v2.4.1/oidn-2.4.1.x86_64.linux.tar.gz && \
+    tar -xzf oidn-2.4.1.x86_64.linux.tar.gz && \
+    rm oidn-2.4.1.x86_64.linux.tar.gz
+
+ENV OIDN_DIR=/opt/oidn-2.4.1.x86_64.linux
+ENV PATH="${OIDN_DIR}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${OIDN_DIR}/lib:${LD_LIBRARY_PATH}"
+
+# Optional: force CUDA device if NVIDIA GPU is visible.
+# Without this, OIDN default selects likely fastest available device.
+ENV OIDN_DEFAULT_DEVICE=cuda
+#ENV OIDN_VERBOSE=1
 
 RUN echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
