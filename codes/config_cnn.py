@@ -99,7 +99,7 @@ config["shuffle_file_list"] = True
 config["dataloader_shuffle"] = True
 config["aug_mode"] = False # to see overfitting, set False                                   
 
-config["max_epoch"] = 3000                  # the max epoch for training
+config["max_epoch"] = 5000                  # the max epoch for training
 config["snapshot"] = 1000 
 
 # config["retrain"] = True
@@ -109,7 +109,7 @@ config["restore_epoch"] = 50
 # =======================================
 # Test parameter
 # =======================================
-config["load_epoch"] = "3000" #'jsa_pretrained'
+config["load_epoch"] = "5000" #'jsa_pretrained'
 
 
 

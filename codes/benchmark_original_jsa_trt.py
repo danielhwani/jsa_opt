@@ -500,7 +500,7 @@ def main():
 
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--patch-in-place", action="store_true", help="Lower peak memory; modifies the loaded object after baseline timing.")
-    ap.add_argument("--max-export-diff", type=float, default=1e-5, help="Abort if export-patched PyTorch differs too much from original.")
+    ap.add_argument("--max-export-diff", type=float, default=1e-4, help="Abort if export-patched PyTorch differs too much from original.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():

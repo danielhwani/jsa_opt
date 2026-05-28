@@ -20,7 +20,7 @@ if [[ -n "${GRADIO_AUTH_USER:-}" || -n "${GRADIO_AUTH_PASS:-}" ]]; then
   AUTH_ARGS+=(--auth-user "$GRADIO_AUTH_USER" --auth-pass "$GRADIO_AUTH_PASS")
 fi
 
-python codes/viewer_jsa_family_oidn_dynamic_trt.py \
+python codes/viewer_jsa_oidn_dynamic_trt.py \
   --data-root "$PROJECT_ROOT/data" \
   --trt-root "$PROJECT_ROOT/benchmark_results/trt" \
   --engine-root "$PROJECT_ROOT/benchmark_results/engine" \
