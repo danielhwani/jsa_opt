@@ -34,7 +34,7 @@ import glob
 from pytz import timezone
 
 
-from config import config
+from config_cnn import config
 from torch.utils.data import DataLoader
 from utils.scheduler import GradualWarmupScheduler
 import dataset
@@ -44,7 +44,8 @@ import utils.utils_options as option
 import loss as L
 import preprocess as pre
 import eval
-import model.model_joint_sa as model_joint_sa
+import model.jsa_4layer_swinir_conv_decoder as model_joint_sa
+
 
 
 def main():
@@ -123,7 +124,7 @@ def main():
     # =======================================
     '''
     #  U-shaped joint self-attention & simple mlp
-    net = model_joint_sa.JSA_transformer(img_size=config["patch_size"],
+    net = model_joint_sa.JSA4LayerSwinIRConvDecoder(img_size=config["patch_size"],
                                     embedded_dim=config["embed_dim"],
                                     win_size=8,
                                     projection_option='linear',

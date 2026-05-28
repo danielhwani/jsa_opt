@@ -17,7 +17,7 @@ bash "$SCRIPTS_DIR/generate_dataset.sh"
 echo ""
 echo ">>> [2/4] Running Training (train.sh)..."
 bash "$SCRIPTS_DIR/train.sh"
-
+bash "$SCRIPTS_DIR/train_conv.sh"
 # 3. Run Benchmark
 echo ""
 echo ">>> [3/4] Running Benchmark (run_benchmark_original_jsa_pth_vs_trt.sh)..."
@@ -26,7 +26,7 @@ bash "$SCRIPTS_DIR/run_benchmark_original_jsa_pth_vs_trt.sh"
 # 4. Run Viewer
 echo ""
 echo ">>> [4/4] Running Viewer (run_viewer.sh)..."
-bash "$SCRIPTS_DIR/run_viewer.sh"
+bash "$SCRIPTS_DIR/run_viewer.sh" "$@"
 
 echo ""
 echo "============================================================"

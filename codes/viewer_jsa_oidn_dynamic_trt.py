@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import base64
 import glob
+import html
 import io
 import json
 import math
@@ -70,6 +71,11 @@ except Exception:
     REPO_CONFIG = {}
 
 try:
+    from config_cnn import config as CONV_CONFIG  # type: ignore
+except Exception:
+    CONV_CONFIG = {}
+
+try:
     import model.model_joint_sa as model_joint_sa
 except Exception:
     try:
@@ -81,6 +87,27 @@ except Exception:
         ORIGINAL_IMPORT_ERROR = None
 else:
     ORIGINAL_IMPORT_ERROR = None
+
+try:
+    from model.jsa_original import OriginalJSATransformer
+except Exception:
+    try:
+        from jsa_original import OriginalJSATransformer  # type: ignore
+    except Exception:
+        OriginalJSATransformer = None  # type: ignore
+
+try:
+    from model.jsa_4layer_swinir_conv_decoder import JSA4LayerSwinIRConvDecoder
+except Exception:
+    try:
+        from jsa_4layer_swinir_conv_decoder import JSA4LayerSwinIRConvDecoder  # type: ignore
+    except Exception as e:
+        JSA4LayerSwinIRConvDecoder = None  # type: ignore
+        CONV_IMPORT_ERROR = e
+    else:
+        CONV_IMPORT_ERROR = None
+else:
+    CONV_IMPORT_ERROR = None
 
 
 # -----------------------------------------------------------------------------
@@ -521,10 +548,13 @@ def discover_trt(trt_root: str) -> Dict[str, TRTInfo]:
         if h != w:
             continue
 
-        if name.startswith("naive_trt"):
-            kind = "Orig TRT"
+        low_name = name.lower()
+        if "conv" in low_name or "swinir" in low_name:
+            kind = "JSA+Conv Torch-TensorRT"
+        elif name.startswith("naive_trt"):
+            kind = "JSA Torch-TensorRT"
         elif name.startswith("optimized_trt"):
-            kind = "Optimized TRT"
+            kind = "JSA Optimized Torch-TensorRT"
         else:
             kind = name
 
@@ -593,12 +623,15 @@ def discover_torch2trt(engine_root: str) -> Dict[str, Torch2TRTInfo]:
             precision = m.group("precision") or "fp16"
             h = int(m.group("h"))
             w = int(m.group("w"))
-            label = f"Torch2TRT {precision.upper()} {h}x{w} ({name})"
+            low_name = name.lower()
+            family = "JSA+Conv" if ("conv" in low_name or "swinir" in low_name) else "JSA"
+            label = f"{family} Torch2TRT {precision.upper()} {h}x{w} ({name})"
         else:
             precision = "fp16"
             h = 0
             w = 0
-            label = f"Torch2TRT ({base})"
+            family = "JSA+Conv" if ("conv" in base.lower() or "swinir" in base.lower()) else "JSA"
+            label = f"{family} Torch2TRT ({base})"
 
         out[label] = Torch2TRTInfo(
             label=label,
@@ -610,28 +643,68 @@ def discover_torch2trt(engine_root: str) -> Dict[str, Torch2TRTInfo]:
         )
     return out
 
-def pth_tile_choices(trt_infos: Dict[str, TRTInfo]) -> List[int]:
+def pth_tile_choices(trt_infos: Dict[str, TRTInfo], t2_infos: Optional[Dict[str, Torch2TRTInfo]] = None) -> List[int]:
     tiles = {512, 1024}
     for info in trt_infos.values():
         tiles.add(info.tile)
+    if t2_infos:
+        for info in t2_infos.values():
+            if info.h:
+                tiles.add(info.h)
     return sorted(tiles)
 
-def build_original_model(tile: int, device: torch.device) -> nn.Module:
-    if model_joint_sa is None:
-        raise RuntimeError(f"Could not import original JSA model: {ORIGINAL_IMPORT_ERROR}")
 
+def _common_kwargs(config: dict, tile: int) -> Dict[str, object]:
+    return {
+        "img_size": tile,
+        "embedded_dim": config.get("embed_dim", 32),
+        "win_size": config.get("win_size", 8),
+        "projection_option": config.get("projection_option", "linear"),
+        "ffn_option": config.get("ffn_option", "mlp"),
+        "depths": config.get("depths", [1, 2, 4, 8, 2, 8, 4, 2, 4]),
+        "num_heads": config.get("num_heads", [1, 2, 4, 8, 16, 8, 4, 2, 1]),
+        "in_x": config.get("x_dim", 3),
+        "in_f": config.get("f_dim", 7),
+    }
+
+
+def build_original_model(tile: int, device: torch.device) -> nn.Module:
     config = REPO_CONFIG if isinstance(REPO_CONFIG, dict) else {}
-    net = model_joint_sa.JSA_transformer(
-        img_size=tile,
-        embedded_dim=config.get("embed_dim", 32),
-        win_size=8,
-        projection_option="linear",
-        ffn_option="mlp",
-        depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
-        in_x=config.get("x_dim", 3),
-        in_f=config.get("f_dim", 7),
-    )
+    kwargs = _common_kwargs(config, tile)
+
+    if OriginalJSATransformer is not None:
+        net = OriginalJSATransformer(**kwargs)
+    else:
+        if model_joint_sa is None:
+            raise RuntimeError(f"Could not import original JSA model: {ORIGINAL_IMPORT_ERROR}")
+        # Current repo/original JSA_transformer constructor.
+        net = model_joint_sa.JSA_transformer(**kwargs)
+
     return net.to(device).eval()
+
+
+def build_conv_model(tile: int, device: torch.device) -> nn.Module:
+    if JSA4LayerSwinIRConvDecoder is None:
+        raise RuntimeError(f"Could not import JSA+Conv model: {CONV_IMPORT_ERROR}")
+
+    config = CONV_CONFIG if isinstance(CONV_CONFIG, dict) and CONV_CONFIG else REPO_CONFIG
+    kwargs = _common_kwargs(config if isinstance(config, dict) else {}, tile)
+    kwargs["decoder_resi_connection"] = (config if isinstance(config, dict) else {}).get("decoder_resi_connection", "3conv")
+    net = JSA4LayerSwinIRConvDecoder(**kwargs)
+    return net.to(device).eval()
+
+
+PTH_RE = re.compile(r"(?P<family>JSA\+Conv|JSA|Orig) PTH tiled (?P<t>\d+)x(?P=t)$")
+
+
+def pth_family_from_label(engine_name: str) -> Optional[Tuple[str, int]]:
+    m = PTH_RE.match(engine_name)
+    if not m:
+        return None
+    fam = m.group("family")
+    if fam == "Orig":
+        fam = "JSA"
+    return fam, int(m.group("t"))
 
 def extract_state_dict(ckpt):
     if isinstance(ckpt, dict):
@@ -677,18 +750,20 @@ class EngineManager:
         t2_infos = self.torch2trt_infos()
         out = []
         if checkpoints(self.data_root):
-            for t in pth_tile_choices(infos):
-                out.append(f"Orig PTH tiled {t}x{t}")
+            for t in pth_tile_choices(infos, t2_infos):
+                out.append(f"JSA PTH tiled {t}x{t}")
+                out.append(f"JSA+Conv PTH tiled {t}x{t}")
         out.extend(infos.keys())
         out.extend(t2_infos.keys())
         return out
 
     def source_info(self, engine_name: str, ckpt_path: Optional[str]) -> Dict[str, object]:
-        pth_m = re.match(r"Orig PTH tiled (?P<t>\d+)x(?P=t)$", engine_name)
-        if pth_m:
+        pth_info = pth_family_from_label(engine_name)
+        if pth_info:
+            fam, tile = pth_info
             return {
-                "engine_kind": "PTH",
-                "engine_tile": int(pth_m.group("t")),
+                "engine_kind": f"PTH-{fam}",
+                "engine_tile": tile,
                 "engine_precision": "fp32",
                 "engine_source": ckpt_path or "",
                 "engine_source_name": os.path.basename(ckpt_path or ""),
@@ -728,12 +803,15 @@ class EngineManager:
         if key in self.cache:
             return self.cache[key]
 
-        pth_m = re.match(r"Orig PTH tiled (?P<t>\d+)x(?P=t)$", engine_name)
-        if pth_m:
+        pth_info = pth_family_from_label(engine_name)
+        if pth_info:
             if not ckpt_path:
-                raise FileNotFoundError("Select checkpoint for Orig PTH.")
-            tile = int(pth_m.group("t"))
-            net = build_original_model(tile, self.device)
+                raise FileNotFoundError("Select checkpoint for the selected PTH engine.")
+            fam, tile = pth_info
+            if fam == "JSA+Conv":
+                net = build_conv_model(tile, self.device)
+            else:
+                net = build_original_model(tile, self.device)
             load_ckpt(net, ckpt_path)
             mod = TiledWrapper(OrigPTHConcat(net), tile=tile, input_dtype=torch.float32).to(self.device).eval()
         else:
@@ -994,6 +1072,34 @@ def measure_engine(mod: nn.Module, inp: torch.Tensor, warmup: int = 3, runs: int
     }
 
 
+
+def compact_engine_kind(engine_name: str, source_info: Dict[str, object]) -> str:
+    """Return compact family/runtime label for the Last 5 runs table."""
+    name = str(engine_name or "")
+    source = str(source_info.get("engine_source_name") or source_info.get("engine_source") or "")
+    raw_kind = str(source_info.get("engine_kind") or "")
+
+    text = f"{name} {source} {raw_kind}".lower()
+
+    is_conv = (
+        "jsa+conv" in text
+        or "jsa_conv" in text
+        or "jsacnn" in text
+        or "swinir" in text
+        or "conv_decoder" in text
+    )
+
+    is_pth = (
+        name.startswith("JSA PTH")
+        or name.startswith("JSA+Conv PTH")
+        or raw_kind.startswith("PTH")
+        or raw_kind.startswith("PTH-")
+    )
+
+    family = "JSA+Conv" if is_conv else "JSA"
+    runtime = "pth" if is_pth else "trt"
+    return f"{family}-{runtime}"
+
 # -----------------------------------------------------------------------------
 # Gradio app
 # -----------------------------------------------------------------------------
@@ -1010,25 +1116,123 @@ class ViewerApp:
         self.run_history: List[Dict[str, object]] = []
 
     def history_markdown(self) -> str:
+        """Compact HTML history table.
+
+        Columns intentionally avoid both Engine and Source because they duplicate
+        information already encoded in Kind and in the saved output folder.
+        """
         if not self.run_history:
             return "### Last 5 runs\n_No runs yet._"
+
+        def esc(v):
+            return html.escape("" if v is None else str(v), quote=True)
+
+        def fmt(v, nd=4):
+            if v is None:
+                return "-"
+            if isinstance(v, (float, int)):
+                return f"{float(v):.{nd}g}"
+            return str(v)
+
         rows = self.run_history[-5:][::-1]
-        header = "| # | Scene | Engine | Kind | Source | relMSE(EXR) | OIDN relMSE | Time(ms) | OIDN Time(ms) | Saved |\n"
-        sep = "|---:|---|---|---|---|---:|---:|---:|---:|---|\n"
-        body = ""
+        html_rows = []
         for i, r in enumerate(rows, 1):
-            def fmt(v, nd=4):
-                if v is None:
-                    return "-"
-                if isinstance(v, (float, int)):
-                    return f"{float(v):.{nd}g}"
-                return str(v)
-            body += (
-                f"| {i} | {r.get('scene','')} | {r.get('engine','')} | {r.get('kind','')} | "
-                f"{r.get('source','')} | {fmt(r.get('relmse_exr'))} | {fmt(r.get('oidn_relmse_exr'))} | "
-                f"{fmt(r.get('time_ms'), 5)} | {fmt(r.get('oidn_time_ms'), 5)} | `{r.get('saved','')}` |\n"
+            scene = esc(r.get("scene", ""))
+            kind = esc(r.get("kind_compact") or r.get("kind", ""))
+            relmse = esc(fmt(r.get("relmse_exr")))
+            oidn_relmse = esc(fmt(r.get("oidn_relmse_exr")))
+            time_ms = esc(fmt(r.get("time_ms"), 5))
+            oidn_time_ms = esc(fmt(r.get("oidn_time_ms"), 5))
+            saved = esc(r.get("saved", ""))
+            source = esc(r.get("source", ""))
+            engine = esc(r.get("engine", ""))
+
+            html_rows.append(
+                "<tr>"
+                f"<td class='idx'>{i}</td>"
+                f"<td class='scene' title='{scene}'>{scene}</td>"
+                f"<td class='kind' title='engine: {engine}&#10;source: {source}'>{kind}</td>"
+                f"<td class='num'>{relmse}</td>"
+                f"<td class='num'>{oidn_relmse}</td>"
+                f"<td class='num'>{time_ms}</td>"
+                f"<td class='num'>{oidn_time_ms}</td>"
+                f"<td class='saved'><code title='{saved}'>{saved}</code></td>"
+                "</tr>"
             )
-        return "### Last 5 runs\n" + header + sep + body
+
+        style = """
+<style>
+.viewer-history-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+}
+.viewer-history {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 980px;
+  table-layout: auto;
+  font-size: 13px;
+}
+.viewer-history th, .viewer-history td {
+  border: 1px solid #d0d0d0;
+  padding: 6px 8px;
+  vertical-align: middle;
+}
+.viewer-history th {
+  background: #f5f7fa;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.viewer-history td.idx {
+  width: 34px;
+  text-align: right;
+  white-space: nowrap;
+}
+.viewer-history td.scene {
+  max-width: 210px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.viewer-history td.kind {
+  width: 120px;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.viewer-history td.num {
+  width: 92px;
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.viewer-history td.saved {
+  max-width: 520px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.viewer-history td.saved code {
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+</style>
+"""
+        table = (
+            style
+            + "<div class='viewer-history-wrap'>"
+            + "<table class='viewer-history'>"
+            + "<thead><tr>"
+            + "<th>#</th><th>Scene</th><th>Kind</th>"
+            + "<th>relMSE(EXR)</th><th>OIDN relMSE</th>"
+            + "<th>Time(ms)</th><th>OIDN Time(ms)</th><th>Saved</th>"
+            + "</tr></thead>"
+            + "<tbody>"
+            + "".join(html_rows)
+            + "</tbody></table></div>"
+        )
+        return "### Last 5 runs\n" + table
 
     def refresh(self):
         self.samples = discover_samples(self.data_root)
@@ -1131,6 +1335,7 @@ class ViewerApp:
             "scene": Path(sample_key).stem,
             "engine": engine_name,
             "kind": source_info.get("engine_kind"),
+            "kind_compact": compact_engine_kind(engine_name, source_info),
             "source": source_info.get("engine_source_name"),
             "relmse_exr": metrics.get("relMSE_linear_exr"),
             "oidn_relmse_exr": metrics.get("oidn_relMSE_linear_exr"),
@@ -1308,14 +1513,14 @@ class ViewerApp:
             gr.update(choices=sample_keys, value=(preferred or (sample_keys[0] if sample_keys else None))),
         )
 
-    def launch(self, host: str, port: int, share: bool):
+    def launch(self, host: str, port: int, share: bool, auth_user: Optional[str] = None, auth_pass: Optional[str] = None):
         sample_keys = list(self.sample_map.keys())
         engines = self.engine_mgr.choices()
         ckpts = checkpoints(self.data_root)
         default_oidn_cmd = "oidnDenoise -f RT -hdr {color} -alb {albedo} -nrm {normal} -o {out}"
 
-        with gr.Blocks(title="JSA / TRT / torch2trt / OIDN Viewer fast timing") as demo:
-            gr.Markdown("## JSA / TRT / torch2trt / OIDN Interactive Viewer — fast timing")
+        with gr.Blocks(title="JSA / JSA+Conv / TRT / torch2trt / OIDN Viewer") as demo:
+            gr.Markdown("## JSA / JSA+Conv / TRT / torch2trt / OIDN Interactive Viewer")
             gr.Markdown(
                 f"`data_root={self.data_root}` / `trt_root={self.trt_root}` / "
                 f"`engine_root={self.engine_root}` / "
@@ -1328,7 +1533,7 @@ class ViewerApp:
                 sample_dd = gr.Dropdown(label="Input file", choices=sample_keys, value=(sample_keys[0] if sample_keys else None), scale=4)
                 engine_dd = gr.Dropdown(label="Denoising engine", choices=engines, value=(engines[0] if engines else None), scale=3)
             with gr.Row():
-                ckpt_dd = gr.Dropdown(label="Checkpoint for Orig PTH", choices=ckpts, value=(ckpts[0] if ckpts else None), scale=4)
+                ckpt_dd = gr.Dropdown(label="Checkpoint for selected PTH engine", choices=ckpts, value=(ckpts[0] if ckpts else None), scale=4)
                 refresh_btn = gr.Button("Refresh pool", scale=1)
                 run_btn = gr.Button("Run", variant="primary", scale=1)
 
@@ -1439,7 +1644,13 @@ class ViewerApp:
             )
             refresh_btn.click(self.refresh, outputs=[sample_dd, engine_dd, ckpt_dd])
 
-        demo.launch(server_name=host, server_port=port, share=share)
+        auth = None
+        if auth_user or auth_pass:
+            if not (auth_user and auth_pass):
+                raise ValueError("Both auth_user and auth_pass must be provided when enabling Gradio auth.")
+            auth = (auth_user, auth_pass)
+
+        demo.launch(server_name=host, server_port=port, share=share, auth=auth)
 
 
 def main():
@@ -1451,10 +1662,18 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--share", action="store_true")
+    ap.add_argument("--auth-user", default=os.environ.get("GRADIO_AUTH_USER"))
+    ap.add_argument("--auth-pass", default=os.environ.get("GRADIO_AUTH_PASS"))
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
-    ViewerApp(args.data_root, args.trt_root, args.engine_root, args.output_root, args.device).launch(args.host, args.port, args.share)
+    ViewerApp(args.data_root, args.trt_root, args.engine_root, args.output_root, args.device).launch(
+        args.host,
+        args.port,
+        args.share,
+        auth_user=args.auth_user,
+        auth_pass=args.auth_pass,
+    )
 
 
 if __name__ == "__main__":

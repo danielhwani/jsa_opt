@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal original-JSA FP16 torch2trt benchmark/export with export-time graph patching.
+Minimal JSA-family FP16 torch2trt benchmark/export with export-time graph patching.
 
 This script does NOT edit model_joint_sa.py and does NOT change the trained checkpoint.
 It creates an export-only copy of the loaded model, applies mathematically equivalent
@@ -20,7 +20,7 @@ Export-only patches:
      This removes relative_position_bias_table[relative_position_index] tensor indexing
      from the export graph.
 
-The original model is used for reference timing/quality. The export copy is compared
+The selected PyTorch model is used for reference timing/quality. The export copy is compared
 against the original PyTorch output before torch2trt conversion.
 
 Artifacts:
@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import importlib
 import json
 import math
 import os
@@ -63,42 +64,80 @@ def add_repo_paths(repo_root: Path):
             sys.path.insert(0, str(p))
 
 
-def get_config():
+def get_config(config_module: str):
+    """Load config dict from config.py or config_cnn.py.
+
+    For original JSA, default is config.
+    For JSA+Conv, default is config_cnn because conv_train.py uses it.
+    """
     try:
-        from config import config
-        return config
-    except Exception:
+        mod = importlib.import_module(config_module)
+        return getattr(mod, "config", {})
+    except Exception as e:
+        print(f"[warn] failed to import {config_module}.config: {e}")
         return {}
 
 
-def build_original_jsa(config: dict, img_size: int):
-    try:
-        from model.model_joint_sa import JSA_transformer
-    except Exception:
-        from model_joint_sa import JSA_transformer
+def _common_model_kwargs(config: dict, img_size: int):
+    return dict(
+        img_size=img_size,
+        embedded_dim=config.get("embed_dim", 32),
+        win_size=config.get("win_size", 8),
+        projection_option=config.get("projection_option", "linear"),
+        ffn_option=config.get("ffn_option", "mlp"),
+        depths=config.get("depths", [1, 2, 4, 8, 2, 8, 4, 2, 4]),
+        num_heads=config.get("num_heads", [1, 2, 4, 8, 16, 8, 4, 2, 1]),
+        in_x=config.get("x_dim", 3),
+        in_f=config.get("f_dim", 7),
+    )
 
-    # Current repo/original full JSA constructor.
-    try:
-        return JSA_transformer(
-            img_size=img_size,
-            embedded_dim=config.get("embed_dim", 32),
-            win_size=8,
-            projection_option="linear",
-            ffn_option="mlp",
-            depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
-            in_x=config.get("x_dim", 3),
-            in_f=config.get("f_dim", 7),
-        )
-    except TypeError:
-        # Fallback for older/smaller JSA constructor.
-        return JSA_transformer(
-            in_x=config.get("x_dim", 3),
-            in_f=config.get("f_dim", 7),
-            img_size=img_size,
-            embedded_dim=config.get("embed_dim", 32),
-            depths=[1, 2, 4, 2, 4],
-            num_heads=[1, 2, 4, 2, 1],
-        )
+
+def build_jsa_family_model(config: dict, img_size: int, model_kind: str):
+    """Build either original JSA or JSA+Conv with the same constructor size.
+
+    model_kind:
+      - jsa: original 4-layer JSA
+      - conv: JSA with SwinIR-style convolutional final decoder
+    """
+    kind = model_kind.lower()
+    kwargs = _common_model_kwargs(config, img_size)
+
+    if kind in ("jsa", "original", "original_jsa"):
+        # Prefer the stable wrapper if available; fall back to repo's original JSA_transformer.
+        try:
+            from model.jsa_original import OriginalJSATransformer
+            return OriginalJSATransformer(**kwargs)
+        except Exception:
+            try:
+                from jsa_original import OriginalJSATransformer
+                return OriginalJSATransformer(**kwargs)
+            except Exception:
+                try:
+                    from model.model_joint_sa import JSA_transformer
+                except Exception:
+                    from model_joint_sa import JSA_transformer
+                try:
+                    return JSA_transformer(**kwargs)
+                except TypeError:
+                    # Fallback for older/smaller JSA constructor.
+                    return JSA_transformer(
+                        in_x=kwargs["in_x"],
+                        in_f=kwargs["in_f"],
+                        img_size=img_size,
+                        embedded_dim=kwargs["embedded_dim"],
+                        depths=[1, 2, 4, 2, 4],
+                        num_heads=[1, 2, 4, 2, 1],
+                    )
+
+    if kind in ("conv", "jsa_conv", "jsa+conv", "swinir_conv", "jsa_4layer_swinir_conv_decoder"):
+        try:
+            from model.jsa_4layer_swinir_conv_decoder import JSA4LayerSwinIRConvDecoder
+        except Exception:
+            from jsa_4layer_swinir_conv_decoder import JSA4LayerSwinIRConvDecoder
+        kwargs["decoder_resi_connection"] = config.get("decoder_resi_connection", "3conv")
+        return JSA4LayerSwinIRConvDecoder(**kwargs)
+
+    raise ValueError(f"Unknown --model-kind {model_kind!r}. Use 'jsa' or 'conv'.")
 
 
 def extract_state_dict(ckpt):
@@ -437,6 +476,10 @@ def save_torch2trt_artifacts(model_trt: TRTModule, out_prefix: Path, save_ts: bo
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-root", default="/workspace")
+    ap.add_argument("--model-kind", choices=["jsa", "conv"], default="jsa",
+                    help="jsa: original JSA, conv: JSA+SwinIR-style conv final decoder")
+    ap.add_argument("--config-module", default=None,
+                    help="Python config module. Defaults to config for JSA and config_cnn for JSA+Conv.")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--epoch", default=None)
 
@@ -471,7 +514,9 @@ def main():
 
     repo_root = Path(args.repo_root).resolve()
     add_repo_paths(repo_root)
-    config = get_config()
+    if args.config_module is None:
+        args.config_module = "config_cnn" if args.model_kind == "conv" else "config"
+    config = get_config(args.config_module)
 
     checkpoint = args.checkpoint or default_checkpoint(config, args.epoch)
     if checkpoint is None or not os.path.exists(checkpoint):
@@ -482,12 +527,14 @@ def main():
     img_size = int(args.img_size or max(h, w))
 
     print(f"[config] repo_root={repo_root}")
+    print(f"[config] model_kind={args.model_kind}")
+    print(f"[config] config_module={args.config_module}")
     print(f"[config] checkpoint={checkpoint}")
     print(f"[config] input size={args.batch_size}x3/7x{h}x{w}")
     print(f"[config] JSA img_size={img_size}")
 
-    print("[1] Load original JSA")
-    model = build_original_jsa(config, img_size=img_size)
+    print("[1] Load selected model")
+    model = build_jsa_family_model(config, img_size=img_size, model_kind=args.model_kind)
     load_checkpoint(model, checkpoint)
     model = model.to(device).eval()
 
@@ -502,7 +549,7 @@ def main():
         gt = None
     example_inputs = (x, f)
 
-    print("[3] Original PyTorch inference / timing")
+    print("[3] Selected PyTorch inference / timing")
     with torch.no_grad():
         pred_pt = model(x, f)
     pt_time = cuda_time_ms(lambda: model(x, f), args.warmup, args.iters)
@@ -557,11 +604,14 @@ def main():
 
     print("[7] Save artifacts")
     if args.name is None:
-        args.name = f"jsa_torch2trt_exportpatch_fp16_{args.batch_size}x3x{h}x{w}"
+        prefix = "jsa_conv" if args.model_kind == "conv" else "jsa"
+        args.name = f"{prefix}_torch2trt_exportpatch_fp16_{args.batch_size}x3x{h}x{w}"
     out_prefix = Path(args.out_dir) / args.name
     paths = save_torch2trt_artifacts(model_trt, out_prefix, args.save_ts, example_inputs)
 
     results = {
+        "model_kind": args.model_kind,
+        "config_module": args.config_module,
         "checkpoint": checkpoint,
         "input_npz": args.input_npz,
         "shape_x": list(x.shape),
@@ -592,12 +642,12 @@ def main():
     print(f"[saved] results: {json_path}")
 
     print("\n=== Summary ===")
-    print(f"Original PyTorch avg : {pt_time['avg_ms']:.4f} ms")
+    print(f"Selected PyTorch avg : {pt_time['avg_ms']:.4f} ms")
     print(f"Export PyTorch avg   : {export_time['avg_ms']:.4f} ms")
     print(f"torch2trt avg        : {trt_time['avg_ms']:.4f} ms")
-    print(f"speedup vs original  : {results['speedup_avg_vs_original']:.3f}x")
+    print(f"speedup vs selected PyTorch  : {results['speedup_avg_vs_original']:.3f}x")
     print(f"export patch max diff: {export_diff['export_patch_vs_original_max_abs']:.6e}")
-    print(f"trt/orig max diff    : {trt_orig_diff['torch2trt_vs_original_max_abs']:.6e}")
+    print(f"trt/selected max diff    : {trt_orig_diff['torch2trt_vs_original_max_abs']:.6e}")
     print(f"engine               : {paths['engine']}")
     print(f"torch2trt pth         : {paths['torch2trt_pth']}")
     print(f"ts                   : {paths['ts']}")
