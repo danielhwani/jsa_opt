@@ -114,7 +114,7 @@ config["restore_epoch"] = 50
 # =======================================
 # Test parameter
 # =======================================
-config["load_epoch"] = "5000" #'jsa_pretrained'
+config["load_epoch"] = "3000" #'jsa_pretrained'
 
 
 

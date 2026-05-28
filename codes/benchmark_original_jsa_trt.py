@@ -1,72 +1,312 @@
 #!/usr/bin/env python3
 """
-Tiled 512x512 benchmark for original JSA / optimized JSA / TensorRT.
+Minimal original-JSA FP16 torch2trt benchmark/export with export-time graph patching.
 
-What this does:
-  - compile TensorRT modules at tile size, default 512x512
-  - run full-frame inference by split-and-stitch
-  - save TRT TorchScript modules for reuse
-  - save eval-style linear EXR + tonemapped PNG
-  - compute both log-domain metrics and eval-style postprocessed/tone-mapped metrics
+This script does NOT edit model_joint_sa.py and does NOT change the trained checkpoint.
+It creates an export-only copy of the loaded model, applies mathematically equivalent
+inference/export patches, then converts that copy with torch2trt.
 
-Backends:
-  1. original_pytorch_tiled
-  2. optimized_pytorch_tiled
-  3. naive_trt_fp16_tiled
-  4. optimized_trt_fp16_tiled
-  5. optimized_trt_int8_tiled, optional
+Export-only patches:
+  1. nn.PixelShuffle / nn.PixelUnshuffle
+     -> equivalent view/permute/reshape modules.
+     This avoids custom pixel converters.
 
-Notes:
-  - Saved TRT files are Torch-TensorRT TorchScript modules (.ts), not raw .engine.
-  - INT8 calibration uses torch_tensorrt.ts.ptq first, matching the older timeTest.py style.
+  2. LinearProjection
+     -> equivalent projection module with to_q, to_k, to_v as separate Linear layers.
+     This removes q[0], kv[0], kv[1] indexing from the export graph.
+
+  3. WindowJointAttention relative-position bias lookup
+     -> precomputed buffer.
+     This removes relative_position_bias_table[relative_position_index] tensor indexing
+     from the export graph.
+
+The original model is used for reference timing/quality. The export copy is compared
+against the original PyTorch output before torch2trt conversion.
+
+Artifacts:
+  - .engine          raw TensorRT engine for C++/Unreal/TensorRT Runtime
+  - .torch2trt.pth   torch2trt TRTModule Python reload artifact
+  - .ts              best-effort torch.jit.trace(TRTModule), may fail on some installs
+  - .json            timings and diff metrics
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
+import copy
 import gc
 import json
 import math
 import os
 import random
 import statistics
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import tensorrt as trt  # noqa: F401
+from torch2trt import TRTModule, torch2trt
+
 
 # -----------------------------------------------------------------------------
-# Optional original repo utilities for eval-style tone mapping
+# Repo imports
 # -----------------------------------------------------------------------------
 
-def import_eval_utils():
-    util_image = None
-    util_rend = None
+def add_repo_paths(repo_root: Path):
+    for p in [repo_root, repo_root / "codes", repo_root / "codes" / "model"]:
+        if str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+
+
+def get_config():
     try:
-        import utils.utils_image as util_image  # type: ignore
-    except Exception as e:
-        print(f"[warn] could not import utils.utils_image: {e}")
+        from config import config
+        return config
+    except Exception:
+        return {}
 
-    for mod_name in ("utils.utils_rend_img", "utils.utils_rend"):
-        try:
-            util_rend = __import__(mod_name, fromlist=["dummy"])
-            break
-        except Exception:
-            pass
 
-    if util_rend is None:
-        print("[warn] could not import utils.utils_rend_img or utils.utils_rend; using fallback tone mapping")
+def build_original_jsa(config: dict, img_size: int):
+    try:
+        from model.model_joint_sa import JSA_transformer
+    except Exception:
+        from model_joint_sa import JSA_transformer
 
-    return util_image, util_rend
+    # Current repo/original full JSA constructor.
+    try:
+        return JSA_transformer(
+            img_size=img_size,
+            embedded_dim=config.get("embed_dim", 32),
+            win_size=8,
+            projection_option="linear",
+            ffn_option="mlp",
+            depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
+            in_x=config.get("x_dim", 3),
+            in_f=config.get("f_dim", 7),
+        )
+    except TypeError:
+        # Fallback for older/smaller JSA constructor.
+        return JSA_transformer(
+            in_x=config.get("x_dim", 3),
+            in_f=config.get("f_dim", 7),
+            img_size=img_size,
+            embedded_dim=config.get("embed_dim", 32),
+            depths=[1, 2, 4, 2, 4],
+            num_heads=[1, 2, 4, 2, 1],
+        )
+
+
+def extract_state_dict(ckpt):
+    if isinstance(ckpt, dict):
+        for key in ("state_dict", "model_state_dict", "model", "net", "params"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                return ckpt[key]
+        if any(torch.is_tensor(v) for v in ckpt.values()):
+            return ckpt
+    raise RuntimeError("Could not find model state_dict in checkpoint")
+
+
+def clean_state_dict(sd):
+    return {k[len("module."):] if k.startswith("module.") else k: v for k, v in sd.items()}
+
+
+def default_checkpoint(config: dict, epoch: Optional[str]) -> Optional[str]:
+    if not config:
+        return None
+    if epoch is None:
+        epoch = str(config.get("load_epoch", "best"))
+    task = config.get("task", "")
+    data_dir = config.get("data_dir", config.get("DataDirectory", "/workspace/data"))
+    if not task:
+        return None
+    return str(Path(data_dir) / task / "__checkpoints__" / f"epoch_{task}_{epoch}.pth")
+
+
+def load_checkpoint(model: torch.nn.Module, checkpoint_path: str):
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    sd = clean_state_dict(extract_state_dict(ckpt))
+    msg = model.load_state_dict(sd, strict=True)
+    print(f"[ckpt] strict load OK: {checkpoint_path} | {msg}")
 
 
 # -----------------------------------------------------------------------------
-# Preprocessing / metrics
+# Export-only equivalent modules
+# -----------------------------------------------------------------------------
+
+class ExportPixelUnshuffle(nn.Module):
+    def __init__(self, downscale_factor: int):
+        super().__init__()
+        self.r = int(downscale_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        r = self.r
+        # Same mapping as F.pixel_unshuffle.
+        x = x.reshape(b, c, h // r, r, w // r, r)
+        x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+        return x.reshape(b, c * r * r, h // r, w // r)
+
+
+class ExportPixelShuffle(nn.Module):
+    def __init__(self, upscale_factor: int):
+        super().__init__()
+        self.r = int(upscale_factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, crr, h, w = x.shape
+        r = self.r
+        c = crr // (r * r)
+        # Same mapping as F.pixel_shuffle.
+        x = x.reshape(b, c, r, r, h, w)
+        x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
+        return x.reshape(b, c, h * r, w * r)
+
+
+class ExportLinearProjection(nn.Module):
+    """Mathematically equivalent to original LinearProjection, but no q[0]/kv[0] indexing."""
+
+    def __init__(self, src: nn.Module):
+        super().__init__()
+        self.heads = int(src.heads)
+        self.dim = int(src.dim)
+        self.inner_dim = int(src.inner_dim)
+
+        self.to_q = copy.deepcopy(src.to_q)
+
+        # Split original to_kv Linear into independent to_k and to_v.
+        old = src.to_kv
+        self.to_k = nn.Linear(old.in_features, self.inner_dim, bias=(old.bias is not None))
+        self.to_v = nn.Linear(old.in_features, self.inner_dim, bias=(old.bias is not None))
+
+        with torch.no_grad():
+            self.to_k.weight.copy_(old.weight[:self.inner_dim])
+            self.to_v.weight.copy_(old.weight[self.inner_dim:])
+            if old.bias is not None:
+                self.to_k.bias.copy_(old.bias[:self.inner_dim])
+                self.to_v.bias.copy_(old.bias[self.inner_dim:])
+
+    def forward(self, x: torch.Tensor):
+        b, n, c = x.shape
+        h = self.heads
+        d = c // h
+
+        q = self.to_q(x).reshape(b, n, h, d).permute(0, 2, 1, 3).contiguous()
+        k = self.to_k(x).reshape(b, n, h, d).permute(0, 2, 1, 3).contiguous()
+        v = self.to_v(x).reshape(b, n, h, d).permute(0, 2, 1, 3).contiguous()
+        return q, k, v
+
+
+class ExportWindowJointAttention(nn.Module):
+    """Equivalent WindowJointAttention with precomputed relative-position bias."""
+
+    def __init__(self, src: nn.Module):
+        super().__init__()
+        self.dim = src.dim
+        self.win_size = src.win_size
+        self.num_heads = src.num_heads
+        self.scale = src.scale
+        self.token_projection = getattr(src, "token_projection", "linear")
+
+        if self.token_projection != "linear":
+            # Keep conv path as-is if it appears, but current JSA uses linear.
+            self.qkv = copy.deepcopy(src.qkv)
+            self.qkv_f = copy.deepcopy(src.qkv_f)
+        else:
+            self.qkv = ExportLinearProjection(src.qkv)
+            self.qkv_f = ExportLinearProjection(src.qkv_f)
+
+        self.proj = copy.deepcopy(src.proj)
+        self.softmax = copy.deepcopy(src.softmax)
+        self.act = copy.deepcopy(getattr(src, "act", nn.ReLU()))
+
+        with torch.no_grad():
+            wh = int(self.win_size[0])
+            ww = int(self.win_size[1])
+            bias = src.relative_position_bias_table[src.relative_position_index.reshape(-1)].reshape(
+                wh * ww, wh * ww, -1
+            )
+            bias = bias.permute(2, 0, 1).contiguous()
+        self.register_buffer("relative_position_bias_precomputed", bias)
+
+    def forward(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        b, n, c = x.shape
+
+        q, k, v = self.qkv(x)
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+
+        q_f, k_f, v_f = self.qkv_f(f)
+        q_f = q_f * self.scale
+        attn_f = q_f @ k_f.transpose(-2, -1)
+
+        # In this network, window_partition gives N = win_size*win_size, so no repeat is needed.
+        bias = self.relative_position_bias_precomputed
+        attn = attn + bias.unsqueeze(0)
+        attn_f = attn_f + bias.unsqueeze(0)
+
+        attn = self.softmax(attn * attn_f)
+        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        x = self.proj(x)
+        return x
+
+
+def replace_child_modules(root: nn.Module, stats: dict):
+    """Recursively replace export-hostile modules in an export copy only."""
+    for name, child in list(root.named_children()):
+        cls = child.__class__.__name__
+
+        if isinstance(child, nn.PixelUnshuffle):
+            setattr(root, name, ExportPixelUnshuffle(child.downscale_factor))
+            stats["pixel_unshuffle"] += 1
+            continue
+
+        if isinstance(child, nn.PixelShuffle):
+            setattr(root, name, ExportPixelShuffle(child.upscale_factor))
+            stats["pixel_shuffle"] += 1
+            continue
+
+        if cls == "WindowJointAttention":
+            setattr(root, name, ExportWindowJointAttention(child))
+            stats["window_attention"] += 1
+            continue
+
+        # LinearProjection is normally inside WindowJointAttention and replaced above.
+        # Keep this fallback for unusual placements.
+        if cls == "LinearProjection":
+            setattr(root, name, ExportLinearProjection(child))
+            stats["linear_projection"] += 1
+            continue
+
+        replace_child_modules(child, stats)
+
+
+def make_export_model(original: nn.Module, device: torch.device, in_place: bool = False) -> Tuple[nn.Module, dict]:
+    """Create export-only copy and apply equivalent graph patches."""
+    if in_place:
+        export_model = original
+    else:
+        # Move original to CPU before deepcopy only if user needs to save GPU memory.
+        # Here we keep it simple; 4090/24GB generally handles this for 1024.
+        export_model = copy.deepcopy(original)
+
+    stats = {
+        "pixel_unshuffle": 0,
+        "pixel_shuffle": 0,
+        "window_attention": 0,
+        "linear_projection": 0,
+    }
+    replace_child_modules(export_model, stats)
+    export_model = export_model.to(device).eval()
+    return export_model, stats
+
+
+# -----------------------------------------------------------------------------
+# Input / metrics
 # -----------------------------------------------------------------------------
 
 def preprocess_normal_np(normal: np.ndarray) -> np.ndarray:
@@ -79,541 +319,34 @@ def preprocess_specular_torch(x: torch.Tensor) -> torch.Tensor:
     return torch.log1p(torch.clamp(x, min=0.0))
 
 
-def postprocess_specular_np_chw(log_chw: np.ndarray, util_rend=None) -> np.ndarray:
-    """Return linear CHW from log-domain CHW."""
-    if util_rend is not None and hasattr(util_rend, "postprocess_specular"):
-        return util_rend.postprocess_specular(log_chw)
-    return np.maximum(np.expm1(log_chw), 0.0).astype(np.float32)
-
-
-def fallback_tonemap_uint8(linear_chw: np.ndarray) -> np.ndarray:
-    """Simple fallback only used if original util_rend.tensor2img is unavailable."""
-    img = np.transpose(linear_chw, (1, 2, 0))
-    img = np.nan_to_num(img, nan=0.0, posinf=1e10, neginf=0.0)
-    img = np.maximum(img, 0.0)
-    img = img / (1.0 + img)
-    img = np.clip(img, 0.0, 1.0)
-    img = np.power(img, 1.0 / 2.2)
-    return (img * 255.0 + 0.5).astype(np.uint8)
-
-
-def to_eval_png_from_pred_log(pred_log_chw: np.ndarray, util_rend=None):
-    if util_rend is not None and hasattr(util_rend, "tensor2img"):
-        return util_rend.tensor2img(pred_log_chw, post_spec=True)
-    return fallback_tonemap_uint8(postprocess_specular_np_chw(pred_log_chw, util_rend=None))
-
-
-def to_eval_png_from_gt_linear(gt_linear_chw: np.ndarray, util_rend=None):
-    if util_rend is not None and hasattr(util_rend, "tensor2img"):
-        return util_rend.tensor2img(gt_linear_chw)
-    return fallback_tonemap_uint8(gt_linear_chw)
-
-
-def rel_l2(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    true_mean = torch.mean(target, dim=1, keepdim=True)
-    return torch.mean(torch.square(target - pred) / (torch.square(true_mean) + 1e-2))
-
-
-def mse_psnr(pred: torch.Tensor, target: torch.Tensor) -> Tuple[float, float]:
-    mse = torch.mean((pred - target) ** 2).item()
-    peak = max(float(target.max().item()), 1.0)
-    psnr = 10.0 * math.log10((peak * peak) / max(mse, 1e-12))
-    return mse, psnr
-
-
-def crop_hw(y: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
-    h, w = hw
-    return y[..., :h, :w]
-
-
-def cleanup_cuda(*objs, note: str = ""):
-    """Best-effort cleanup between heavy TRT compile stages."""
-    for obj in objs:
-        try:
-            del obj
-        except Exception:
-            pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        if note:
-            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-            print(f"[mem] after cleanup {note}: allocated={allocated:.3f}GB reserved={reserved:.3f}GB")
-
-
-def pad_to_tile_multiple_tensor(x: torch.Tensor, tile: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
-    """Pad BCHW to a multiple of tile in H/W; returns padded tensor and original hw."""
-    _, _, h, w = x.shape
-    pad_h = ((h + tile - 1) // tile) * tile - h
-    pad_w = ((w + tile - 1) // tile) * tile - w
-    mode = "reflect"
-    if pad_h >= h or pad_w >= w:
-        mode = "replicate"
-    padded = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
-    return padded, (h, w)
-
-
-# -----------------------------------------------------------------------------
-# Dataset
-# -----------------------------------------------------------------------------
-
-def natural_key(path: str):
-    import re
-    base = os.path.basename(path)
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", base)]
-
-
-def find_npz_pairs(config, limit: Optional[int]) -> List[Tuple[str, str]]:
-    test_dir = Path(config["testDatasetDirectory"])
-    input_npz = test_dir / f"{config['test_input']}_npz"
-    target_npz = test_dir / f"{config['test_target']}_npz"
-
-    if not input_npz.exists() or not target_npz.exists() or len(list(input_npz.glob("*.npz"))) == 0:
-        print(f"[data] NPZ not found under {input_npz}. Trying preprocess.construct_test_dataset_to_npz(config)...")
-        import preprocess as pre
-        pre.construct_test_dataset_to_npz(config)
-
-    inputs = sorted(glob.glob(str(input_npz / "*.npz")), key=natural_key)
-    targets = sorted(glob.glob(str(target_npz / "*.npz")), key=natural_key)
-
-    if len(inputs) == 0:
-        raise RuntimeError(f"No input NPZ files found: {input_npz}")
-    if len(inputs) != len(targets):
-        raise RuntimeError(f"Input/target count mismatch: {len(inputs)} vs {len(targets)}")
-
-    if limit is not None and limit > 0:
-        inputs = inputs[:limit]
-        targets = targets[:limit]
-    return list(zip(inputs, targets))
-
-
-def load_npz_pair_full(input_path: str, target_path: str, device: torch.device):
-    inp = np.load(input_path)
-    gt_npz = np.load(target_path)
-
-    color = inp["color"].astype(np.float32)
-    aux = inp["aux"].astype(np.float32)
-    target_linear = gt_npz["color"].astype(np.float32)
-
+def load_npz_input(input_npz: str, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    z = np.load(input_npz)
+    color = z["color"].astype(np.float32)
+    aux = z["aux"].astype(np.float32)
     aux = aux.copy()
     aux[..., 3:6] = preprocess_normal_np(aux[..., 3:6])
 
-    x_linear = torch.from_numpy(color).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
+    x = torch.from_numpy(color).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
     f = torch.from_numpy(aux).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-    gt_linear = torch.from_numpy(target_linear).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
+    x_log = preprocess_specular_torch(x)
 
-    x_log = preprocess_specular_torch(x_linear)
-    gt_log = preprocess_specular_torch(gt_linear)
+    gt = None
+    target_npz = input_npz.replace("/input_npz/", "/target_npz/")
+    if os.path.exists(target_npz):
+        t = np.load(target_npz)["color"].astype(np.float32)
+        gt_linear = torch.from_numpy(t).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
+        gt = preprocess_specular_torch(gt_linear)
 
-    return x_log, f, gt_log, gt_linear, tuple(x_log.shape[-2:])
+    return x_log, f, gt
 
 
-class CalibTileDataset(torch.utils.data.Dataset):
-    """Actual-data calibration tiles [10,tile,tile]."""
+def random_input(batch: int, h: int, w: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    x = torch.rand(batch, 3, h, w, device=device, dtype=torch.float32)
+    f = torch.rand(batch, 7, h, w, device=device, dtype=torch.float32)
+    return x, f
 
-    def __init__(self, pairs: List[Tuple[str, str]], tile: int, max_tiles: int):
-        self.tile = int(tile)
-        self.items = []
-        for input_path, target_path in pairs:
-            color = np.load(input_path)["color"]
-            h, w = color.shape[:2]
-            ph = ((h + tile - 1) // tile) * tile
-            pw = ((w + tile - 1) // tile) * tile
-            for y in range(0, ph, tile):
-                for x in range(0, pw, tile):
-                    self.items.append((input_path, target_path, y, x))
-        if max_tiles > 0:
-            self.items = self.items[:max_tiles]
 
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx: int):
-        input_path, target_path, y, x = self.items[idx]
-        # CPU loading for DataLoaderCalibrator.
-        x_log, f, _, _, _ = load_npz_pair_full(input_path, target_path, torch.device("cpu"))
-        inp = torch.cat([x_log, f], dim=1)
-        inp, _ = pad_to_tile_multiple_tensor(inp, self.tile)
-        tile = inp[:, :, y:y+self.tile, x:x+self.tile].contiguous().squeeze(0)
-        # Match TensorRT Input(..., dtype=torch.half) used for INT8/PTQ compile.
-        return tile.half()
-
-
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
-
-class OriginalConcatWrapper(nn.Module):
-    def __init__(self, model: nn.Module, in_x: int = 3, in_f: int = 7):
-        super().__init__()
-        self.model = model
-        self.in_x = int(in_x)
-        self.in_f = int(in_f)
-
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        x = inp[:, :self.in_x]
-        f = inp[:, self.in_x:self.in_x + self.in_f]
-        try:
-            return self.model(x=x, f=f)
-        except TypeError:
-            return self.model(x, f)
-
-
-class SpaceToDepth(nn.Module):
-    def __init__(self, r: int):
-        super().__init__()
-        self.r = int(r)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        r = self.r
-        x = x.view(b, c, h // r, r, w // r, r)
-        x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
-        return x.view(b, c * r * r, h // r, w // r)
-
-
-class DepthToSpace(nn.Module):
-    def __init__(self, r: int):
-        super().__init__()
-        self.r = int(r)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, crr, h, w = x.shape
-        r = self.r
-        c = crr // (r * r)
-        x = x.view(b, c, r, r, h, w)
-        x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
-        return x.view(b, c, h * r, w * r)
-
-
-def replace_pixel_ops(module: nn.Module):
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.PixelUnshuffle):
-            setattr(module, name, SpaceToDepth(child.downscale_factor))
-        elif isinstance(child, nn.PixelShuffle):
-            setattr(module, name, DepthToSpace(child.upscale_factor))
-        else:
-            replace_pixel_ops(child)
-
-
-def build_original_model(config, img_size: int):
-    import model.model_joint_sa as model_joint_sa
-    return model_joint_sa.JSA_transformer(
-        img_size=img_size,
-        embedded_dim=config["embed_dim"],
-        win_size=8,
-        projection_option="linear",
-        ffn_option="mlp",
-        depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
-        in_x=config["x_dim"],
-        in_f=config["f_dim"],
-    )
-
-
-def build_v2_model(config, img_size: int):
-    import model.model_joint_sa_v2_int8 as model_joint_sa_v2
-    try:
-        return model_joint_sa_v2.JSA_transformer(
-            img_size=img_size,
-            embedded_dim=config["embed_dim"],
-            win_size=8,
-            projection_option="linear",
-            ffn_option="mlp",
-            depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
-            in_x=config["x_dim"],
-            in_f=config["f_dim"],
-        )
-    except TypeError:
-        return model_joint_sa_v2.JSA_transformer(
-            image_size=img_size,
-            embedded_dim=config["embed_dim"],
-            win_size=8,
-            projection_option="linear",
-            ffn_option="mlp",
-            depths=[1, 2, 4, 8, 2, 8, 4, 2, 4],
-            in_x=config["x_dim"],
-            in_f=config["f_dim"],
-        )
-
-
-def extract_state_dict(ckpt):
-    if isinstance(ckpt, dict):
-        for key in ["state_dict", "model_state_dict", "model", "net", "params"]:
-            if key in ckpt and isinstance(ckpt[key], dict):
-                sd = ckpt[key]
-                if any(torch.is_tensor(v) for v in sd.values()):
-                    return sd
-        if any(torch.is_tensor(v) for v in ckpt.values()):
-            return ckpt
-    raise RuntimeError("Could not find a state_dict in checkpoint.")
-
-
-def clean_state_dict(sd):
-    return {k[len("module."):] if k.startswith("module.") else k: v for k, v in sd.items()}
-
-
-def load_checkpoint_strict(net: nn.Module, checkpoint_path: str):
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    sd = clean_state_dict(extract_state_dict(ckpt))
-    msg = net.load_state_dict(sd, strict=True)
-    print(f"[ckpt] strict load OK: {checkpoint_path} | {msg}")
-
-
-def default_checkpoint_path(config, epoch: str):
-    task_dir = Path(config["data_dir"]) / config["task"]
-    checkpoint_dir = task_dir / "__checkpoints__"
-    return str(checkpoint_dir / f"epoch_{config['task']}_{epoch}.pth")
-
-
-def apply_optimized_patches_after_load(net: nn.Module, patch_level: str):
-    if patch_level not in {"none", "pixel", "int8"}:
-        raise ValueError(patch_level)
-
-    if patch_level in {"pixel", "int8"}:
-        print("[patch] replace PixelShuffle/PixelUnshuffle with DepthToSpace/SpaceToDepth")
-        replace_pixel_ops(net)
-
-    if patch_level == "int8":
-        import model.model_joint_sa_v2_int8 as model_joint_sa_v2
-        if hasattr(model_joint_sa_v2, "patch_model_for_int8"):
-            print("[patch] applying patch_model_for_int8 AFTER strict checkpoint load")
-            model_joint_sa_v2.patch_model_for_int8(net)
-        elif hasattr(model_joint_sa_v2, "patch_model_for_trt"):
-            print("[patch] applying patch_model_for_trt AFTER strict checkpoint load")
-            model_joint_sa_v2.patch_model_for_trt(net)
-        else:
-            print("[patch][warn] no patch_model_for_int8/patch_model_for_trt found")
-
-
-def make_model_backend(config, checkpoint: str, tile: int, kind: str, patch_level: str, device: torch.device):
-    if kind == "original":
-        m = build_original_model(config, tile)
-        load_checkpoint_strict(m, checkpoint)
-        return OriginalConcatWrapper(m, config["x_dim"], config["f_dim"]).to(device).eval()
-
-    if kind == "optimized":
-        m = build_v2_model(config, tile)
-        load_checkpoint_strict(m, checkpoint)
-        apply_optimized_patches_after_load(m, patch_level)
-        return m.to(device).eval()
-
-    raise ValueError(kind)
-
-
-# -----------------------------------------------------------------------------
-# Tile split/stitch
-# -----------------------------------------------------------------------------
-
-class TRTInputCastWrapper(nn.Module):
-    """Force Half input immediately before Torch-TensorRT engine call."""
-    def __init__(self, trt_module: nn.Module, output_dtype=torch.float32, debug: bool = False):
-        super().__init__()
-        self.trt_module = trt_module
-        self.output_dtype = output_dtype
-        self.debug = debug
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.debug:
-            print("[TRTInputCastWrapper] before cast:", x.dtype, x.device, tuple(x.shape), flush=True)
-
-        # Hard-code this. Do not depend on self.input_dtype for now.
-        x = x.contiguous().to(device=x.device, dtype=torch.float16)
-
-        if self.debug:
-            print("[TRTInputCastWrapper] after  cast:", x.dtype, x.device, tuple(x.shape), flush=True)
-
-        assert x.dtype == torch.float16, f"TRT input cast failed: got {x.dtype}"
-
-        y = self.trt_module(x)
-
-        if self.output_dtype is not None and y.dtype != self.output_dtype:
-            y = y.to(dtype=self.output_dtype)
-
-        return y
-    
-class TiledInferenceWrapper(nn.Module):
-    """Runs a tile module over a full frame by split-and-stitch.
-
-    module_input_dtype is needed for Torch-TensorRT FP16 modules, whose engine
-    input type is Half. PyTorch reference modules and INT8 TRT modules usually
-    consume Float.
-    """
-
-    def __init__(self, tile_module: nn.Module, tile: int, module_input_dtype=None, output_dtype=torch.float32):
-        super().__init__()
-        self.tile_module = tile_module
-        self.tile = int(tile)
-        self.module_input_dtype = module_input_dtype
-        self.output_dtype = output_dtype
-
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        tile = self.tile
-        inp_pad, orig_hw = pad_to_tile_multiple_tensor(inp, tile)
-        _, _, hp, wp = inp_pad.shape
-        rows = []
-        for y in range(0, hp, tile):
-            cols = []
-            for x in range(0, wp, tile):
-                t = inp_pad[:, :, y:y+tile, x:x+tile].contiguous()
-                if self.module_input_dtype is not None and t.dtype != self.module_input_dtype:
-                    t = t.to(dtype=self.module_input_dtype)
-                y_tile = self.tile_module(t)
-                if self.output_dtype is not None and y_tile.dtype != self.output_dtype:
-                    y_tile = y_tile.to(dtype=self.output_dtype)
-                cols.append(y_tile)
-            rows.append(torch.cat(cols, dim=3))
-        out = torch.cat(rows, dim=2)
-        return crop_hw(out, orig_hw)
-
-
-# -----------------------------------------------------------------------------
-# TensorRT compile/save/load
-# -----------------------------------------------------------------------------
-
-def _get_torch_tensorrt_ptq_module():
-    try:
-        from torch_tensorrt.ts import ptq
-        return ptq, "torch_tensorrt.ts.ptq"
-    except Exception:
-        pass
-
-    try:
-        import torch_tensorrt
-        if hasattr(torch_tensorrt, "ptq"):
-            return torch_tensorrt.ptq, "torch_tensorrt.ptq"
-    except Exception:
-        pass
-
-    raise RuntimeError("No Torch-TensorRT PTQ calibrator API found.")
-
-
-def make_int8_calibrator(pairs: List[Tuple[str, str]], tile: int, cache_file: str,
-                         max_tiles: int, batch_size: int, device: torch.device):
-    ptq, ns = _get_torch_tensorrt_ptq_module()
-    print(f"[INT8] using PTQ API: {ns}")
-
-    ds = CalibTileDataset(pairs, tile=tile, max_tiles=max_tiles)
-    if len(ds) == 0:
-        raise RuntimeError("No calibration tiles available.")
-
-    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
-
-    algo = None
-    if hasattr(ptq, "CalibrationAlgo"):
-        for name in ["ENTROPY_CALIBRATION_2", "ENTROPY", "MINMAX_CALIBRATION", "MINMAX"]:
-            if hasattr(ptq.CalibrationAlgo, name):
-                algo = getattr(ptq.CalibrationAlgo, name)
-                break
-
-    kwargs = {"cache_file": cache_file}
-    if algo is not None:
-        kwargs["algo_type"] = algo
-
-    try:
-        return ptq.DataLoaderCalibrator(loader, use_cache=False, device=device, **kwargs)
-    except TypeError:
-        pass
-
-    try:
-        return ptq.DataLoaderCalibrator(loader, **kwargs)
-    except TypeError:
-        kwargs.pop("algo_type", None)
-        return ptq.DataLoaderCalibrator(loader, **kwargs)
-
-
-def trt_module_path(trt_dir: str | Path, name: str, precision: str, shape: torch.Size) -> Path:
-    b, c, h, w = [int(v) for v in shape]
-    return Path(trt_dir) / f"{name}_{precision}_{b}x{c}x{h}x{w}.ts"
-
-
-def compile_trt_ts(module: nn.Module, example_input: torch.Tensor, precision: str, require_full: bool,
-                   workspace_gb: int, calibrator=None, debug: bool = False):
-    import torch_tensorrt
-
-    module = module.eval().to(example_input.device)
-
-    if precision == "fp16":
-        trace_input = example_input.half()
-        module = module.half()
-        trt_input = torch_tensorrt.Input(trace_input.shape, dtype=torch.half)
-        enabled = {torch.half}
-    elif precision == "fp32":
-        trace_input = example_input.float()
-        module = module.float()
-        trt_input = torch_tensorrt.Input(trace_input.shape, dtype=torch.float)
-        enabled = {torch.float}
-    elif precision == "int8":
-        # Match the timeTest-style PTQ path:
-        # Input binding is Half, with INT8 kernels and FP16 fallback enabled.
-        trace_input = example_input.half()
-        module = module.half()
-        trt_input = torch_tensorrt.Input(trace_input.shape, dtype=torch.half)
-        enabled = {torch.int8, torch.half}
-    else:
-        raise ValueError(precision)
-
-    print(f"[TRT] trace/compile precision={precision}, input={tuple(trace_input.shape)}, dtype={trace_input.dtype}")
-
-    with torch.no_grad():
-        ts = torch.jit.trace(module, trace_input)
-
-    kwargs = dict(
-        ir="ts",
-        inputs=[trt_input],
-        enabled_precisions=enabled,
-        require_full_compilation=require_full,
-        truncate_long_and_double=True,
-        workspace_size=int(workspace_gb) << 30,
-        min_block_size=1,
-    )
-    if calibrator is not None:
-        kwargs["calibrator"] = calibrator
-    if debug:
-        kwargs["debug"] = True
-
-    try:
-        compiled = torch_tensorrt.compile(ts, **kwargs)
-    except TypeError:
-        kwargs.pop("debug", None)
-        compiled = torch_tensorrt.compile(ts, **kwargs)
-
-    return compiled.eval()
-
-
-def get_or_compile_tile_trt(name: str, module: nn.Module, example_input: torch.Tensor, precision: str,
-                            args, calibrator=None):
-    save_path = trt_module_path(args.save_trt_dir, name, precision, example_input.shape) if args.save_trt_dir else None
-    load_path = trt_module_path(args.load_trt_dir, name, precision, example_input.shape) if args.load_trt_dir else None
-
-    if args.load_trt_dir and load_path.exists() and not args.force_recompile:
-        print(f"[load TRT] {load_path}")
-        return torch.jit.load(str(load_path), map_location=example_input.device).eval()
-
-    mod = compile_trt_ts(
-        module,
-        example_input,
-        precision=precision,
-        require_full=args.require_full_trt,
-        workspace_gb=args.workspace_gb,
-        calibrator=calibrator,
-        debug=args.trt_debug,
-    )
-
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.jit.save(mod, str(save_path))
-        print(f"[saved TRT] {save_path}")
-
-    return mod
-
-
-# -----------------------------------------------------------------------------
-# Evaluation / saving
-# -----------------------------------------------------------------------------
-
-def time_module(fn, warmup: int, iters: int):
+def cuda_time_ms(fn, warmup: int, iters: int) -> dict:
     torch.cuda.synchronize()
     with torch.no_grad():
         for _ in range(warmup):
@@ -629,7 +362,7 @@ def time_module(fn, warmup: int, iters: int):
             _ = fn()
             end.record()
             torch.cuda.synchronize()
-            times.append(start.elapsed_time(end))
+            times.append(float(start.elapsed_time(end)))
 
     return {
         "avg_ms": float(sum(times) / len(times)),
@@ -640,72 +373,61 @@ def time_module(fn, warmup: int, iters: int):
     }
 
 
-def eval_style_metrics_and_save(name: str, idx: int, pred_log: torch.Tensor, gt_log: torch.Tensor,
-                                gt_linear: torch.Tensor, out_dir: Optional[Path], util_image, util_rend):
-    pred_log_chw = pred_log.detach().cpu().numpy()[0].astype(np.float32)
-    gt_log_chw = gt_log.detach().cpu().numpy()[0].astype(np.float32)
-    gt_linear_chw = gt_linear.detach().cpu().numpy()[0].astype(np.float32)
+def diff_metrics(name: str, a: torch.Tensor, b: torch.Tensor) -> dict:
+    d = a.float() - b.float()
+    return {
+        f"{name}_mean_abs": float(d.abs().mean().item()),
+        f"{name}_max_abs": float(d.abs().max().item()),
+        f"{name}_rmse": float(torch.sqrt(torch.mean(d * d)).item()),
+    }
 
-    pred_linear_chw = postprocess_specular_np_chw(pred_log_chw, util_rend=util_rend)
 
-    # eval-style tonemapped images
-    pred_png = to_eval_png_from_pred_log(pred_log_chw, util_rend=util_rend)
-    gt_png = to_eval_png_from_gt_linear(gt_linear_chw, util_rend=util_rend)
+def gt_metrics(name: str, pred: torch.Tensor, gt: Optional[torch.Tensor]) -> dict:
+    if gt is None:
+        return {}
+    mse = torch.mean((pred.float() - gt.float()) ** 2).item()
+    return {
+        f"{name}_mse_log_to_gt": float(mse),
+        f"{name}_psnr_log_to_gt": float(10.0 * math.log10(1.0 / max(mse, 1e-12))),
+    }
 
-    rmse = float(np.sqrt(np.mean((np.transpose(pred_linear_chw, (1, 2, 0)) -
-                                  np.transpose(gt_linear_chw, (1, 2, 0))) ** 2)))
-    psnr_eval = None
-    ssim_eval = None
-    if util_image is not None and hasattr(util_image, "calculate_psnr"):
-        psnr_eval = float(util_image.calculate_psnr(pred_png.copy(), gt_png.copy()))
-    if util_image is not None and hasattr(util_image, "calculate_ssim"):
+
+# -----------------------------------------------------------------------------
+# Save artifacts
+# -----------------------------------------------------------------------------
+
+def save_torch2trt_artifacts(model_trt: TRTModule, out_prefix: Path, save_ts: bool, example_inputs):
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    engine_path = out_prefix.with_suffix(".engine")
+    pth_path = out_prefix.with_suffix(".torch2trt.pth")
+    ts_path = out_prefix.with_suffix(".ts")
+
+    with open(engine_path, "wb") as f:
+        f.write(model_trt.engine.serialize())
+    print(f"[saved] raw TensorRT engine: {engine_path}")
+
+    torch.save(model_trt.state_dict(), pth_path)
+    print(f"[saved] torch2trt TRTModule state_dict: {pth_path}")
+
+    ts_ok = False
+    if save_ts:
         try:
-            ssim_eval = float(util_image.calculate_ssim(pred_png.copy(), gt_png.copy()))
-        except Exception:
-            ssim_eval = None
-
-    if out_dir is not None:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            import pyexr
-            pyexr.write(str(out_dir / f"{idx:04d}_{name}.linear.exr"), np.transpose(pred_linear_chw, (1, 2, 0)).astype(np.float32))
-            pyexr.write(str(out_dir / f"{idx:04d}_{name}.log.exr"), np.transpose(pred_log_chw, (1, 2, 0)).astype(np.float32))
+            model_trt.eval()
+            with torch.no_grad():
+                traced = torch.jit.trace(model_trt, example_inputs, strict=False)
+            torch.jit.save(traced, str(ts_path))
+            print(f"[saved] best-effort traced TRTModule TorchScript: {ts_path}")
+            ts_ok = True
         except Exception as e:
-            print(f"[warn] failed to write EXR for {name}: {e}")
-
-        if util_image is not None and hasattr(util_image, "imwrite"):
-            util_image.imwrite(pred_png, str(out_dir / f"{idx:04d}_{name}_evalPSNR{psnr_eval if psnr_eval is not None else -1:.4f}.png"))
-        else:
-            try:
-                from imageio.v2 import imwrite
-                imwrite(str(out_dir / f"{idx:04d}_{name}.png"), pred_png)
-            except Exception as e:
-                print(f"[warn] failed to write PNG for {name}: {e}")
+            print(f"[warn] failed to save .ts from torch2trt TRTModule: {e}")
+            print("[warn] Use .engine for C++/Unreal and .torch2trt.pth for Python viewer reload.")
 
     return {
-        "eval_rmse_linear": rmse,
-        "eval_psnr_tonemapped": psnr_eval,
-        "eval_ssim_tonemapped": ssim_eval,
+        "engine": str(engine_path),
+        "torch2trt_pth": str(pth_path),
+        "ts": str(ts_path) if ts_ok else None,
     }
-
-
-def summarize_output(name: str, pred: torch.Tensor, gt_log: torch.Tensor, ref: Optional[torch.Tensor]):
-    mse, psnr = mse_psnr(pred, gt_log)
-    out = {
-        "rel_l2_log": float(rel_l2(pred, gt_log).item()),
-        "mse_log": mse,
-        "psnr_log": psnr,
-    }
-    if ref is not None:
-        d = pred - ref
-        out.update({
-            "diff_mean_abs_to_original_log": float(d.abs().mean().item()),
-            "diff_max_abs_to_original_log": float(d.abs().max().item()),
-            "diff_rmse_to_original_log": float(torch.sqrt(torch.mean(d * d)).item()),
-        })
-    print(f"[{name}] relL2_log={out['rel_l2_log']:.8f} mse_log={out['mse_log']:.8e} psnr_log={out['psnr_log']:.4f}"
-          + (f" | diff_mean_log={out.get('diff_mean_abs_to_original_log', 0):.3e} diff_max_log={out.get('diff_max_abs_to_original_log', 0):.3e}" if ref is not None else ""))
-    return out
 
 
 # -----------------------------------------------------------------------------
@@ -713,46 +435,33 @@ def summarize_output(name: str, pred: torch.Tensor, gt_log: torch.Tensor, ref: O
 # -----------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--epoch", default=None)
-    parser.add_argument("--limit", type=int, default=1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo-root", default="/workspace")
+    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument("--epoch", default=None)
 
-    parser.add_argument("--tile-size", type=int, default=512)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=100)
+    ap.add_argument("--height", type=int, default=1024)
+    ap.add_argument("--width", type=int, default=1024)
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--input-npz", default=None)
 
-    # Legacy: if the target-specific patch levels below are not set, this value is used.
-    parser.add_argument("--optimized-patch-level", choices=["none", "pixel", "int8"], default="pixel")
+    ap.add_argument("--img-size", type=int, default=None, help="JSA constructor img_size. Defaults to max(height,width).")
+    ap.add_argument("--workspace-gb", type=int, default=8)
+    ap.add_argument("--fp16", action="store_true", default=True)
+    ap.add_argument("--save-ts", action="store_true")
 
-    # Target-specific optimized model patch levels.
-    # Use separate model instances because patch_model_for_int8() and .half()/.float() are in-place-like.
-    parser.add_argument("--opt-pytorch-patch-level", choices=["none", "pixel", "int8"], default=None)
-    parser.add_argument("--opt-fp16-patch-level", choices=["none", "pixel", "int8"], default=None)
-    parser.add_argument("--opt-int8-patch-level", choices=["none", "pixel", "int8"], default="int8")
+    ap.add_argument("--warmup", type=int, default=20)
+    ap.add_argument("--iters", type=int, default=100)
+    ap.add_argument("--out-dir", default="benchmark_results/engine")
+    ap.add_argument("--name", default=None)
 
-    parser.add_argument("--compile-int8", action="store_true")
-    parser.add_argument("--int8-calib-cache", default=None)
-    parser.add_argument("--int8-calib-max-tiles", type=int, default=16)
-    parser.add_argument("--int8-calib-batch-size", type=int, default=1)
-
-    parser.add_argument("--require-full-trt", action="store_true")
-    parser.add_argument("--workspace-gb", type=int, default=2)
-    parser.add_argument("--trt-debug", action="store_true")
-    parser.add_argument("--skip-trt", action="store_true")
-
-    parser.add_argument("--save-trt-dir", default=None)
-    parser.add_argument("--load-trt-dir", default=None)
-    parser.add_argument("--force-recompile", action="store_true")
-
-    parser.add_argument("--save-json", default=None)
-    parser.add_argument("--save-exr-dir", default=None)
-
-    parser.add_argument("--seed", type=int, default=3040)
-    args = parser.parse_args()
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--patch-in-place", action="store_true", help="Lower peak memory; modifies the loaded object after baseline timing.")
+    ap.add_argument("--max-export-diff", type=float, default=1e-5, help="Abort if export-patched PyTorch differs too much from original.")
+    args = ap.parse_args()
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required.")
+        raise RuntimeError("CUDA GPU is required")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -760,163 +469,138 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.benchmark = True
 
-    from config import config
-    util_image, util_rend = import_eval_utils()
+    repo_root = Path(args.repo_root).resolve()
+    add_repo_paths(repo_root)
+    config = get_config()
+
+    checkpoint = args.checkpoint or default_checkpoint(config, args.epoch)
+    if checkpoint is None or not os.path.exists(checkpoint):
+        raise FileNotFoundError(f"Checkpoint not found. Provide --checkpoint. Got: {checkpoint}")
 
     device = torch.device("cuda:0")
-    epoch = args.epoch if args.epoch is not None else str(config["load_epoch"])
-    checkpoint = args.checkpoint or default_checkpoint_path(config, epoch)
+    h, w = int(args.height), int(args.width)
+    img_size = int(args.img_size or max(h, w))
 
-    print(f"[config] task={config['task']}")
-    print(f"[config] testDatasetDirectory={config['testDatasetDirectory']}")
-    opt_pytorch_patch = args.opt_pytorch_patch_level or args.optimized_patch_level
-    opt_fp16_patch = args.opt_fp16_patch_level or args.optimized_patch_level
-    opt_int8_patch = args.opt_int8_patch_level or args.optimized_patch_level
-
+    print(f"[config] repo_root={repo_root}")
     print(f"[config] checkpoint={checkpoint}")
-    print(f"[config] tile_size={args.tile_size}")
-    print(f"[config] opt_pytorch_patch_level={opt_pytorch_patch}")
-    print(f"[config] opt_fp16_patch_level={opt_fp16_patch}")
-    print(f"[config] opt_int8_patch_level={opt_int8_patch}")
+    print(f"[config] input size={args.batch_size}x3/7x{h}x{w}")
+    print(f"[config] JSA img_size={img_size}")
 
-    pairs = find_npz_pairs(config, args.limit)
-    all_pairs = find_npz_pairs(config, limit=None)
+    print("[1] Load original JSA")
+    model = build_original_jsa(config, img_size=img_size)
+    load_checkpoint(model, checkpoint)
+    model = model.to(device).eval()
 
-    # PyTorch tiled modules. Keep these as reference modules and do not mutate them during TRT compile.
-    original_tile = make_model_backend(config, checkpoint, args.tile_size, "original", opt_pytorch_patch, device)
-    optimized_tile = make_model_backend(config, checkpoint, args.tile_size, "optimized", opt_pytorch_patch, device)
+    print("[2] Prepare input")
+    if args.input_npz:
+        x, f, gt = load_npz_input(args.input_npz, device)
+        if x.shape[-2:] != (h, w):
+            print(f"[warn] NPZ resolution {tuple(x.shape[-2:])} differs from --height/--width. Using NPZ shape.")
+            h, w = x.shape[-2:]
+    else:
+        x, f = random_input(args.batch_size, h, w, device)
+        gt = None
+    example_inputs = (x, f)
 
-    original_tiled = TiledInferenceWrapper(original_tile, args.tile_size, module_input_dtype=torch.float32, output_dtype=torch.float32).to(device).eval()
-    optimized_tiled = TiledInferenceWrapper(optimized_tile, args.tile_size, module_input_dtype=torch.float32, output_dtype=torch.float32).to(device).eval()
-    cleanup_cuda(note="after PyTorch reference model build")
+    print("[3] Original PyTorch inference / timing")
+    with torch.no_grad():
+        pred_pt = model(x, f)
+    pt_time = cuda_time_ms(lambda: model(x, f), args.warmup, args.iters)
+    print(f"[pytorch/original] avg={pt_time['avg_ms']:.4f} ms med={pt_time['median_ms']:.4f} ms")
 
-    # TRT tile modules. Each compile target gets its own fresh model instance.
-    compiled_tile_modules = {}
-    if not args.skip_trt:
-        example_input = torch.randn(
-            1, config["x_dim"] + config["f_dim"], args.tile_size, args.tile_size,
-            device=device, dtype=torch.float32
+    print("[4] Create export-only equivalent model")
+    export_model, patch_stats = make_export_model(model, device, in_place=args.patch_in_place)
+    print(f"[export patch] {patch_stats}")
+
+    with torch.no_grad():
+        pred_export = export_model(x, f)
+    export_diff = diff_metrics("export_patch_vs_original", pred_export, pred_pt)
+    print(
+        "[export patch diff] "
+        f"mean={export_diff['export_patch_vs_original_mean_abs']:.6e}, "
+        f"max={export_diff['export_patch_vs_original_max_abs']:.6e}, "
+        f"rmse={export_diff['export_patch_vs_original_rmse']:.6e}"
+    )
+
+    if export_diff["export_patch_vs_original_max_abs"] > args.max_export_diff:
+        raise RuntimeError(
+            "Export-patched PyTorch model differs from original more than allowed. "
+            f"max_abs={export_diff['export_patch_vs_original_max_abs']:.6e}, "
+            f"threshold={args.max_export_diff:.6e}"
         )
 
-        try:
-            trt_orig_model = make_model_backend(config, checkpoint, args.tile_size, "original", opt_fp16_patch, device)
-            compiled_tile_modules["naive_trt_fp16"] = get_or_compile_tile_trt(
-                "naive_trt_tile", trt_orig_model, example_input, "fp16", args
-            )
-            cleanup_cuda(trt_orig_model, note="after naive_trt_fp16 compile")
-        except Exception as e:
-            print(f"[TRT][warn] naive_trt_fp16 unavailable: {e}")
-            cleanup_cuda(note="after failed naive_trt_fp16 compile")
+    export_time = cuda_time_ms(lambda: export_model(x, f), max(1, args.warmup // 4), max(5, args.iters // 10))
+    print(f"[pytorch/export] avg={export_time['avg_ms']:.4f} ms med={export_time['median_ms']:.4f} ms")
 
-        try:
-            trt_opt_fp16_model = make_model_backend(config, checkpoint, args.tile_size, "optimized", opt_fp16_patch, device)
-            compiled_tile_modules["optimized_trt_fp16"] = get_or_compile_tile_trt(
-                "optimized_trt_tile", trt_opt_fp16_model, example_input, "fp16", args
-            )
-            cleanup_cuda(trt_opt_fp16_model, note="after optimized_trt_fp16 compile")
-        except Exception as e:
-            print(f"[TRT][warn] optimized_trt_fp16 unavailable: {e}")
-            cleanup_cuda(note="after failed optimized_trt_fp16 compile")
+    print("[5] torch2trt conversion")
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
-        if args.compile_int8:
-            try:
-                cache = args.int8_calib_cache
-                if cache is None:
-                    cache_root = Path(args.save_trt_dir or args.load_trt_dir or "./benchmark_results/trt")
-                    cache_root.mkdir(parents=True, exist_ok=True)
-                    cache = str(cache_root / f"optimized_trt_tile_int8_calib_{args.tile_size}x{args.tile_size}.cache")
+    with torch.inference_mode(), torch.no_grad():
+        model_trt = torch2trt(
+            export_model,
+            list(example_inputs),
+            fp16_mode=bool(args.fp16),
+            max_workspace_size=int(args.workspace_gb) * (1 << 30),
+        )
+    model_trt = model_trt.to(device).eval()
 
-                calibrator = make_int8_calibrator(
-                    all_pairs,
-                    tile=args.tile_size,
-                    cache_file=cache,
-                    max_tiles=args.int8_calib_max_tiles,
-                    batch_size=args.int8_calib_batch_size,
-                    device=device,
-                )
+    print("[6] TensorRT inference / timing")
+    with torch.no_grad():
+        pred_trt = model_trt(x, f)
+    trt_time = cuda_time_ms(lambda: model_trt(x, f), args.warmup, args.iters)
+    print(f"[torch2trt] avg={trt_time['avg_ms']:.4f} ms med={trt_time['median_ms']:.4f} ms")
 
-                trt_opt_int8_model = make_model_backend(config, checkpoint, args.tile_size, "optimized", opt_int8_patch, device)
-                compiled_tile_modules["optimized_trt_int8"] = get_or_compile_tile_trt(
-                    "optimized_trt_tile", trt_opt_int8_model, example_input, "int8", args, calibrator=calibrator
-                )
-                cleanup_cuda(trt_opt_int8_model, calibrator, note="after optimized_trt_int8 compile")
-            except Exception as e:
-                print(f"[INT8][warn] optimized_trt_int8 unavailable: {e}")
-                cleanup_cuda(note="after failed optimized_trt_int8 compile")
+    trt_diff = diff_metrics("torch2trt_vs_export_patch", pred_trt, pred_export)
+    trt_orig_diff = diff_metrics("torch2trt_vs_original", pred_trt, pred_pt)
 
-        cleanup_cuda(example_input, note="after all TRT compiles")
+    print("[7] Save artifacts")
+    if args.name is None:
+        args.name = f"jsa_torch2trt_exportpatch_fp16_{args.batch_size}x3x{h}x{w}"
+    out_prefix = Path(args.out_dir) / args.name
+    paths = save_torch2trt_artifacts(model_trt, out_prefix, args.save_ts, example_inputs)
 
-    compiled_tiled = {}
-    for name, mod in compiled_tile_modules.items():
-        wrapped_trt = TRTInputCastWrapper(
-            mod,
-            output_dtype=torch.float32,
-            debug=True,   
-        ).to(device).eval()
+    results = {
+        "checkpoint": checkpoint,
+        "input_npz": args.input_npz,
+        "shape_x": list(x.shape),
+        "shape_f": list(f.shape),
+        "patch_stats": patch_stats,
+        "pytorch_original": pt_time,
+        "pytorch_export_patch": export_time,
+        "torch2trt": trt_time,
+        "speedup_avg_vs_original": float(pt_time["avg_ms"] / max(trt_time["avg_ms"], 1e-9)),
+        **export_diff,
+        **trt_diff,
+        **trt_orig_diff,
+        **gt_metrics("original", pred_pt, gt),
+        **gt_metrics("export_patch", pred_export, gt),
+        **gt_metrics("torch2trt", pred_trt, gt),
+        "artifacts": paths,
+        "notes": {
+            "export_patch": "Applied only to a copied model object at export time. Source model and checkpoint are unchanged.",
+            "engine": "Raw TensorRT engine for TensorRT Runtime / C++ / Unreal.",
+            "torch2trt_pth": "Python torch2trt TRTModule state_dict reload artifact; supported by the patched viewer.",
+            "ts": "Best-effort trace only. torch2trt does not natively produce Torch-TensorRT .ts.",
+        },
+    }
 
-        compiled_tiled[name] = TiledInferenceWrapper(
-            wrapped_trt,
-            args.tile_size,
-            module_input_dtype=None,
-            output_dtype=torch.float32,
-        ).to(device).eval()
-    results: Dict[str, List[dict]] = {}
-    out_dir = Path(args.save_exr_dir) if args.save_exr_dir else None
+    json_path = out_prefix.with_suffix(".json")
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    print(f"[saved] results: {json_path}")
 
-    def add_result(name, entry):
-        results.setdefault(name, []).append(entry)
-
-    for idx, (input_path, target_path) in enumerate(pairs):
-        print(f"\n[view {idx}] {os.path.basename(input_path)}")
-        x_log, f, gt_log, gt_linear, orig_hw = load_npz_pair_full(input_path, target_path, device)
-        inp = torch.cat([x_log, f], dim=1).contiguous()
-
-        with torch.no_grad():
-            pred_orig = original_tiled(inp)
-            pred_opt = optimized_tiled(inp)
-
-        backends = [
-            ("original_pytorch_tiled", pred_orig, original_tiled),
-            ("optimized_pytorch_tiled", pred_opt, optimized_tiled),
-        ]
-
-        for name, mod in compiled_tiled.items():
-            with torch.no_grad():
-                pred = mod(inp)
-            backends.append((name + "_tiled", pred, mod))
-
-        for name, pred, mod in backends:
-            ref = None if name == "original_pytorch_tiled" else pred_orig
-            entry = summarize_output(name, pred, gt_log, ref)
-            entry.update(eval_style_metrics_and_save(name, idx, pred, gt_log, gt_linear, out_dir, util_image, util_rend))
-            entry.update(time_module(lambda m=mod: m(inp), args.warmup, args.iters))
-            add_result(name, entry)
-
-        cleanup_cuda(x_log, f, gt_log, gt_linear, inp, pred_orig, pred_opt, note=f"after view {idx}")
-
-    print("\n=== Aggregate ===")
-    agg = {}
-    for name, rows in results.items():
-        agg[name] = {}
-        keys = set().union(*(r.keys() for r in rows))
-        for k in keys:
-            vals = [r[k] for r in rows if isinstance(r.get(k), (float, int)) and r.get(k) is not None]
-            if vals:
-                agg[name][k] = float(sum(vals) / len(vals))
-
-        print(f"{name:26s} "
-              f"time_avg={agg[name].get('avg_ms', float('nan')):9.4f} ms "
-              f"time_med={agg[name].get('median_ms', float('nan')):9.4f} ms "
-              f"logPSNR={agg[name].get('psnr_log', float('nan')):.4f} "
-              f"evalPSNR={agg[name].get('eval_psnr_tonemapped', float('nan')):.4f} "
-              f"diff_log={agg[name].get('diff_mean_abs_to_original_log', 0.0):.3e}")
-
-    if args.save_json:
-        out_path = Path(args.save_json)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump({"per_view": results, "aggregate": agg}, f, indent=2)
-        print(f"[saved] {out_path}")
+    print("\n=== Summary ===")
+    print(f"Original PyTorch avg : {pt_time['avg_ms']:.4f} ms")
+    print(f"Export PyTorch avg   : {export_time['avg_ms']:.4f} ms")
+    print(f"torch2trt avg        : {trt_time['avg_ms']:.4f} ms")
+    print(f"speedup vs original  : {results['speedup_avg_vs_original']:.3f}x")
+    print(f"export patch max diff: {export_diff['export_patch_vs_original_max_abs']:.6e}")
+    print(f"trt/orig max diff    : {trt_orig_diff['torch2trt_vs_original_max_abs']:.6e}")
+    print(f"engine               : {paths['engine']}")
+    print(f"torch2trt pth         : {paths['torch2trt_pth']}")
+    print(f"ts                   : {paths['ts']}")
 
 
 if __name__ == "__main__":

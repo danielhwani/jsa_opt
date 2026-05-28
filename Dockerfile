@@ -46,6 +46,12 @@ RUN apt-get update && apt-get install -y \
     cmake && \
     rm -rf /var/lib/apt/lists/*
 RUN pip install mitsuba gradio pillow imageio
+
+# Install torch2trt for original-JSA TensorRT engine export
+RUN git clone --depth=1 https://github.com/NVIDIA-AI-IOT/torch2trt /opt/torch2trt && \
+    cd /opt/torch2trt && \
+    python setup.py install
+    
 RUN apt-get update && apt-get install -y sudo
 
 WORKDIR /opt

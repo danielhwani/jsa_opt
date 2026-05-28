@@ -3,11 +3,15 @@
 Interactive viewer for JSA PTH / Torch-TensorRT / OIDN.
 
 Matches the current benchmark script:
-  - TRT modules are Torch-TensorRT TorchScript .ts files.
-  - TRT file names are parsed dynamically:
+  - TRT modules can be either:
+      1) Torch-TensorRT TorchScript .ts files under benchmark_results/trt
+      2) torch2trt TRTModule state_dict files (*.torch2trt.pth) under benchmark_results/engine
+  - Torch-TensorRT .ts file names are parsed dynamically:
       naive_trt_tile_fp16_1x10x512x512.ts
       optimized_trt_tile_fp16_1x10x1024x1024.ts
       optimized_trt_tile_int8_1x10x512x512.ts
+  - torch2trt files are parsed from:
+      jsa_torch2trt_fp16_1x3x1024x1024.torch2trt.pth
   - TRT runtime input is cast to Half immediately before the engine call.
   - Full images are processed by split/stitch using the tile size parsed from the TRT file name.
   - Denoised outputs are saved under benchmark_results/viewer_outputs/.
@@ -482,7 +486,27 @@ class TRTInfo:
     precision: str
     kind: str
 
+
+@dataclass
+class Torch2TRTInfo:
+    label: str
+    path: str
+    h: int
+    w: int
+    precision: str
+    kind: str
+
+
 TRT_RE = re.compile(r"(?P<name>.+)_(?P<precision>fp16|fp32|int8)_1x(?P<c>\d+)x(?P<h>\d+)x(?P<w>\d+)\.ts$")
+
+# Example:
+#   jsa_torch2trt_fp16_1x3x1024x1024.torch2trt.pth
+# The channel in the filename is the x input channel (=3); the engine itself
+# takes two inputs: x=[B,3,H,W], f=[B,7,H,W].
+TORCH2TRT_RE = re.compile(
+    r"(?P<name>.+?)(?:_(?P<precision>fp16|fp32|int8))?_"
+    r"(?P<b>\d+)x(?P<c>\d+)x(?P<h>\d+)x(?P<w>\d+)\.torch2trt\.pth$"
+)
 
 def discover_trt(trt_root: str) -> Dict[str, TRTInfo]:
     out: Dict[str, TRTInfo] = {}
@@ -507,6 +531,83 @@ def discover_trt(trt_root: str) -> Dict[str, TRTInfo]:
         label = f"{kind} {precision.upper()} {h}x{w}"
         out[label] = TRTInfo(label=label, path=path, tile=h, precision=precision, kind=kind)
 
+    return out
+
+
+class Torch2TRTConcatWrapper(nn.Module):
+    """Wrap torch2trt TRTModule so the viewer can feed [B,10,H,W].
+
+    For timing, use `prepare_inputs()` + `forward_prepared()` to avoid repeating
+    the [B,10,H,W] -> (x, f) split/contiguous work inside every measured run.
+    """
+
+    def __init__(self, pth_path: str, output_dtype=torch.float32):
+        super().__init__()
+        try:
+            from torch2trt import TRTModule
+        except Exception as e:
+            raise RuntimeError("torch2trt is required to load *.torch2trt.pth viewer engines.") from e
+
+        self.trt = TRTModule()
+        state = torch.load(pth_path)
+        self.trt.load_state_dict(state)
+        self.trt.eval()
+        self.output_dtype = output_dtype
+
+    def prepare_inputs(self, inp10: torch.Tensor):
+        x = inp10[:, :3].contiguous()
+        f = inp10[:, 3:10].contiguous()
+        # The simple torch2trt export is built from original model(x, f).
+        # Most torch2trt TRTModule builds accept FP32 bindings even for FP16 engines.
+        if x.dtype != torch.float32:
+            x = x.float()
+            f = f.float()
+        return x, f
+
+    def forward_prepared(self, x: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        y = self.trt(x, f)
+        if self.output_dtype is not None and y.dtype != self.output_dtype:
+            y = y.to(dtype=self.output_dtype)
+        return y
+
+    def forward(self, inp10: torch.Tensor) -> torch.Tensor:
+        x, f = self.prepare_inputs(inp10)
+        return self.forward_prepared(x, f)
+
+
+def discover_torch2trt(engine_root: str) -> Dict[str, Torch2TRTInfo]:
+    out: Dict[str, Torch2TRTInfo] = {}
+    patterns = [
+        os.path.join(engine_root, "*.torch2trt.pth"),
+        os.path.join(engine_root, "**", "*.torch2trt.pth"),
+    ]
+    paths = []
+    for pat in patterns:
+        paths.extend(glob.glob(pat, recursive=True))
+
+    for path in sorted(set(paths), key=natural_key):
+        base = os.path.basename(path)
+        m = TORCH2TRT_RE.match(base)
+        if m:
+            name = m.group("name")
+            precision = m.group("precision") or "fp16"
+            h = int(m.group("h"))
+            w = int(m.group("w"))
+            label = f"Torch2TRT {precision.upper()} {h}x{w} ({name})"
+        else:
+            precision = "fp16"
+            h = 0
+            w = 0
+            label = f"Torch2TRT ({base})"
+
+        out[label] = Torch2TRTInfo(
+            label=label,
+            path=path,
+            h=h,
+            w=w,
+            precision=precision,
+            kind="torch2trt",
+        )
     return out
 
 def pth_tile_choices(trt_infos: Dict[str, TRTInfo]) -> List[int]:
@@ -558,22 +659,28 @@ def ensure_torch_tensorrt_registered():
         ) from e
 
 class EngineManager:
-    def __init__(self, data_root: str, trt_root: str, device: Optional[str]):
+    def __init__(self, data_root: str, trt_root: str, engine_root: str, device: Optional[str]):
         self.data_root = os.path.abspath(data_root)
         self.trt_root = os.path.abspath(trt_root)
+        self.engine_root = os.path.abspath(engine_root)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.cache: Dict[str, nn.Module] = {}
 
     def trt_infos(self) -> Dict[str, TRTInfo]:
         return discover_trt(self.trt_root)
 
+    def torch2trt_infos(self) -> Dict[str, Torch2TRTInfo]:
+        return discover_torch2trt(self.engine_root)
+
     def choices(self) -> List[str]:
         infos = self.trt_infos()
+        t2_infos = self.torch2trt_infos()
         out = []
         if checkpoints(self.data_root):
             for t in pth_tile_choices(infos):
                 out.append(f"Orig PTH tiled {t}x{t}")
         out.extend(infos.keys())
+        out.extend(t2_infos.keys())
         return out
 
     def source_info(self, engine_name: str, ckpt_path: Optional[str]) -> Dict[str, object]:
@@ -588,20 +695,32 @@ class EngineManager:
             }
         infos = self.trt_infos()
         info = infos.get(engine_name)
-        if info is None:
+        if info is not None:
             return {
-                "engine_kind": "unknown",
-                "engine_tile": None,
-                "engine_precision": None,
-                "engine_source": "",
-                "engine_source_name": "",
+                "engine_kind": "Torch-TensorRT-TS",
+                "engine_tile": info.tile,
+                "engine_precision": info.precision,
+                "engine_source": info.path,
+                "engine_source_name": os.path.basename(info.path),
             }
+
+        t2_infos = self.torch2trt_infos()
+        t2_info = t2_infos.get(engine_name)
+        if t2_info is not None:
+            return {
+                "engine_kind": "torch2trt-TRTModule",
+                "engine_tile": t2_info.h if t2_info.h else None,
+                "engine_precision": t2_info.precision,
+                "engine_source": t2_info.path,
+                "engine_source_name": os.path.basename(t2_info.path),
+            }
+
         return {
-            "engine_kind": "TRT",
-            "engine_tile": info.tile,
-            "engine_precision": info.precision,
-            "engine_source": info.path,
-            "engine_source_name": os.path.basename(info.path),
+            "engine_kind": "unknown",
+            "engine_tile": None,
+            "engine_precision": None,
+            "engine_source": "",
+            "engine_source_name": "",
         }
 
     def get(self, engine_name: str, ckpt_path: Optional[str]) -> nn.Module:
@@ -619,13 +738,24 @@ class EngineManager:
             mod = TiledWrapper(OrigPTHConcat(net), tile=tile, input_dtype=torch.float32).to(self.device).eval()
         else:
             infos = self.trt_infos()
-            if engine_name not in infos:
-                raise FileNotFoundError(f"Cannot find TRT engine '{engine_name}' in {self.trt_root}")
-            info = infos[engine_name]
-            ensure_torch_tensorrt_registered()
-            ts = torch.jit.load(info.path, map_location=self.device).eval()
-            # Current benchmark compiles FP16 and INT8 with TensorRT Input(dtype=torch.half).
-            mod = TiledWrapper(ts, tile=info.tile, input_dtype=torch.float16).to(self.device).eval()
+            if engine_name in infos:
+                info = infos[engine_name]
+                ensure_torch_tensorrt_registered()
+                ts = torch.jit.load(info.path, map_location=self.device).eval()
+                # Current benchmark compiles FP16 and INT8 with TensorRT Input(dtype=torch.half).
+                mod = TiledWrapper(ts, tile=info.tile, input_dtype=torch.float16).to(self.device).eval()
+            else:
+                t2_infos = self.torch2trt_infos()
+                if engine_name not in t2_infos:
+                    raise FileNotFoundError(
+                        f"Cannot find engine '{engine_name}' in {self.trt_root} or {self.engine_root}"
+                    )
+                t2_info = t2_infos[engine_name]
+                t2 = Torch2TRTConcatWrapper(t2_info.path, output_dtype=torch.float32).to(self.device).eval()
+                # The torch2trt export is fixed-shape. Use parsed H as tile so full-frame
+                # matching-resolution inputs run in one call; larger inputs are split/stiched.
+                tile = int(t2_info.h or 8192)
+                mod = TiledWrapper(t2, tile=tile, input_dtype=torch.float32).to(self.device).eval()
 
         self.cache[key] = mod
         return mod
@@ -792,10 +922,45 @@ def input_tensor(x_log: np.ndarray, f_net: np.ndarray, device: torch.device) -> 
     f = torch.from_numpy(f_net).permute(2, 0, 1).unsqueeze(0).float()
     return torch.cat([x, f], dim=1).to(device)
 
+def _can_fast_torch2trt(mod: nn.Module, inp: torch.Tensor) -> bool:
+    """True when mod is TiledWrapper(Torch2TRTConcatWrapper) and input exactly matches engine tile."""
+    if not isinstance(mod, TiledWrapper):
+        return False
+    if not isinstance(mod.tile_module, Torch2TRTConcatWrapper):
+        return False
+    _, _, h, w = inp.shape
+    return h == mod.tile and w == mod.tile
+
+
+def run_engine_once(mod: nn.Module, inp: torch.Tensor) -> torch.Tensor:
+    """Run one inference.
+
+    For torch2trt full-frame fixed-shape engines, bypass TiledWrapper and feed
+    prepared x/f directly. This removes viewer-side split/stitch overhead for the
+    actual displayed result.
+    """
+    if _can_fast_torch2trt(mod, inp):
+        x, f = mod.tile_module.prepare_inputs(inp)
+        return mod.tile_module.forward_prepared(x, f)
+    return mod(inp)
+
+
 def measure_engine(mod: nn.Module, inp: torch.Tensor, warmup: int = 3, runs: int = 10) -> Dict[str, float]:
+    # Fast path for torch2trt full-frame fixed-shape engine:
+    # prepare x/f once, then time only TRTModule(x, f).
+    fast_torch2trt = _can_fast_torch2trt(mod, inp)
+
     with torch.no_grad():
+        if fast_torch2trt:
+            x, f = mod.tile_module.prepare_inputs(inp)
+            def call():
+                return mod.tile_module.forward_prepared(x, f)
+        else:
+            def call():
+                return mod(inp)
+
         for _ in range(warmup):
-            _ = mod(inp)
+            _ = call()
         if inp.is_cuda:
             torch.cuda.synchronize()
 
@@ -805,13 +970,13 @@ def measure_engine(mod: nn.Module, inp: torch.Tensor, warmup: int = 3, runs: int
                 st = torch.cuda.Event(enable_timing=True)
                 ed = torch.cuda.Event(enable_timing=True)
                 st.record()
-                _ = mod(inp)
+                _ = call()
                 ed.record()
                 torch.cuda.synchronize()
                 vals.append(float(st.elapsed_time(ed)))
             else:
                 t0 = time.perf_counter()
-                _ = mod(inp)
+                _ = call()
                 vals.append((time.perf_counter() - t0) * 1000.0)
 
     arr = np.asarray(vals, dtype=np.float64)
@@ -821,6 +986,11 @@ def measure_engine(mod: nn.Module, inp: torch.Tensor, warmup: int = 3, runs: int
         "engine_min_ms": float(arr.min()),
         "engine_max_ms": float(arr.max()),
         "engine_std_ms": float(arr.std()),
+        "timing_fast_path": bool(fast_torch2trt),
+        "timing_fast_path_note": (
+            "torch2trt full-frame: pre-split x/f once and time TRTModule(x,f) directly"
+            if fast_torch2trt else "standard viewer wrapper path"
+        ),
     }
 
 
@@ -829,11 +999,12 @@ def measure_engine(mod: nn.Module, inp: torch.Tensor, warmup: int = 3, runs: int
 # -----------------------------------------------------------------------------
 
 class ViewerApp:
-    def __init__(self, data_root: str, trt_root: str, output_root: str, device: Optional[str]):
+    def __init__(self, data_root: str, trt_root: str, engine_root: str, output_root: str, device: Optional[str]):
         self.data_root = os.path.abspath(data_root)
         self.trt_root = os.path.abspath(trt_root)
+        self.engine_root = os.path.abspath(engine_root)
         self.output_root = os.path.abspath(output_root)
-        self.engine_mgr = EngineManager(self.data_root, self.trt_root, device)
+        self.engine_mgr = EngineManager(self.data_root, self.trt_root, self.engine_root, device)
         self.samples = discover_samples(self.data_root)
         self.sample_map = {s.key: s for s in self.samples}
         self.run_history: List[Dict[str, object]] = []
@@ -871,7 +1042,7 @@ class ViewerApp:
             gr.update(choices=ckpts, value=(ckpts[0] if ckpts else None)),
         )
 
-    def run(self, sample_key: str, engine_name: str, ckpt_path: str, run_oidn: bool, oidn_cmd_template: str, center_x: float, center_y: float, crop_size: int):
+    def run(self, sample_key: str, engine_name: str, ckpt_path: str, run_oidn: bool, oidn_cmd_template: str, center_x: float, center_y: float, crop_size: int, engine_warmup: int, engine_runs: int):
         if sample_key not in self.sample_map:
             raise KeyError(f"Unknown sample: {sample_key}")
 
@@ -884,10 +1055,10 @@ class ViewerApp:
         mod = self.engine_mgr.get(engine_name, ckpt_path)
 
         with torch.no_grad():
-            pred_log_t = mod(inp)
+            pred_log_t = run_engine_once(mod, inp)
         pred_log = pred_log_t.detach().cpu().squeeze(0).permute(1, 2, 0).numpy().astype(np.float32)
         pred_linear = expm1_nonneg(pred_log)
-        timing = measure_engine(mod, inp, warmup=3, runs=10)
+        timing = measure_engine(mod, inp, warmup=int(engine_warmup), runs=int(engine_runs))
 
         input_u8 = rgb_to_uint8(simple_tonemap(input_linear))
         pred_u8 = rgb_to_uint8(simple_tonemap(pred_linear))
@@ -1143,10 +1314,11 @@ class ViewerApp:
         ckpts = checkpoints(self.data_root)
         default_oidn_cmd = "oidnDenoise -f RT -hdr {color} -alb {albedo} -nrm {normal} -o {out}"
 
-        with gr.Blocks(title="JSA / TRT / OIDN Viewer v9 v7 v6") as demo:
-            gr.Markdown("## JSA / TRT / OIDN Interactive Viewer")
+        with gr.Blocks(title="JSA / TRT / torch2trt / OIDN Viewer fast timing") as demo:
+            gr.Markdown("## JSA / TRT / torch2trt / OIDN Interactive Viewer — fast timing")
             gr.Markdown(
                 f"`data_root={self.data_root}` / `trt_root={self.trt_root}` / "
+                f"`engine_root={self.engine_root}` / "
                 f"`output_root={self.output_root}`"
             )
 
@@ -1159,6 +1331,15 @@ class ViewerApp:
                 ckpt_dd = gr.Dropdown(label="Checkpoint for Orig PTH", choices=ckpts, value=(ckpts[0] if ckpts else None), scale=4)
                 refresh_btn = gr.Button("Refresh pool", scale=1)
                 run_btn = gr.Button("Run", variant="primary", scale=1)
+
+            with gr.Accordion("Timing settings", open=False):
+                with gr.Row():
+                    engine_warmup = gr.Number(label="Engine warmup runs", value=20, precision=0)
+                    engine_runs = gr.Number(label="Engine timed runs", value=100, precision=0)
+                gr.Markdown(
+                    "For torch2trt full-frame engines, viewer timing uses a fast path: "
+                    "x/f are split once, then only `TRTModule(x, f)` is timed."
+                )
 
             with gr.Accordion("Render a new Mitsuba input", open=False):
                 with gr.Row():
@@ -1227,7 +1408,7 @@ class ViewerApp:
 
             run_btn.click(
                 self.run,
-                inputs=[sample_dd, engine_dd, ckpt_dd, run_oidn, oidn_cmd, center_x_slider, center_y_slider, crop_size_slider],
+                inputs=[sample_dd, engine_dd, ckpt_dd, run_oidn, oidn_cmd, center_x_slider, center_y_slider, crop_size_slider, engine_warmup, engine_runs],
                 outputs=[history_md, main_comp, main_err, main_pred, oidn_status, oidn_err, oidn_pred, metrics, input_state, pred_state, oidn_state, ref_state],
             )
             for _ctrl in (center_x_slider, center_y_slider, crop_size_slider):
@@ -1265,6 +1446,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", default=str(WORKSPACE_ROOT / "data"))
     ap.add_argument("--trt-root", default=str(WORKSPACE_ROOT / "benchmark_results" / "trt"))
+    ap.add_argument("--engine-root", default=str(WORKSPACE_ROOT / "benchmark_results" / "engine"))
     ap.add_argument("--output-root", default=str(WORKSPACE_ROOT / "benchmark_results" / "viewer_outputs"))
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7860)
@@ -1272,7 +1454,7 @@ def main():
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
-    ViewerApp(args.data_root, args.trt_root, args.output_root, args.device).launch(args.host, args.port, args.share)
+    ViewerApp(args.data_root, args.trt_root, args.engine_root, args.output_root, args.device).launch(args.host, args.port, args.share)
 
 
 if __name__ == "__main__":
