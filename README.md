@@ -22,17 +22,17 @@ Detailed description for the background and methods for the paper, written by au
 This directory contains scripts for:
 
 - Rendering an input-reference pair
-  - `scripts/generate_dataset.sh`
-  - To use a different scene, extract the camera parameters from the scene XML and replace the camera pose.
+    - `scripts/generate_dataset.sh`
+    - To use a different scene, extract the camera parameters from the scene XML and replace the camera pose.
 
 - Training the JSA and JSA+Conv models
-  - `train.sh`
-  - `train_conv.sh`
+    - `train.sh`
+    - `train_conv.sh`
 
 - Compiling trained `.pth` checkpoints with TensorRT
 
 - Running the interactive web viewer for inference visualization, metric evaluation, and generation of new test data
-  - [Further documentation](ViewerDocuments_forJSA/viewer.md)
+    - [Further documentation](ViewerDocuments_forJSA/viewer.md)
 
 - Running the end-to-end pipeline, from dataset generation to launching the web viewer
-  - `run_all.sh`
+    - `run_all.sh`
