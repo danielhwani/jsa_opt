@@ -26,5 +26,6 @@ Contains several scripts for
     - train.sh and train_conv.sh
 - Compile trained pth via tensorRT
 - Interactive viewer based inference visualization and measuring statistics including renderer to generate new test data
+    - [for further description](ViewerDocuments_forJSA/viewer.md)
 - and End to end running from generating dataset to open web viewer
     - run_all.sh
