@@ -17,15 +17,22 @@ For more information, please refer to our project page or other resources below:
 
 Detailed description for the background and methods for the paper, written by author
 
-## ReadMe For Web-veiwer based interactive JSA inference test
-Contains several scripts for
-- Render an input-reference pair
-    - scripts/generate_dataset.sh
-    - you can use other scene file, with extract camera parameters from the XML parts for replacing cam pose for the scene
-- Training JSA and JSA + Conv model
-    - train.sh and train_conv.sh
-- Compile trained pth via tensorRT
-- Interactive viewer based inference visualization and measuring statistics including renderer to generate new test data
-    - [for further description](ViewerDocuments_forJSA/viewer.md)
-- and End to end running from generating dataset to open web viewer
-    - run_all.sh
+## README for Web-Based Interactive JSA Inference
+
+This directory contains scripts for:
+
+- Rendering an input-reference pair
+  - `scripts/generate_dataset.sh`
+  - To use a different scene, extract the camera parameters from the scene XML and replace the camera pose.
+
+- Training the JSA and JSA+Conv models
+  - `train.sh`
+  - `train_conv.sh`
+
+- Compiling trained `.pth` checkpoints with TensorRT
+
+- Running the interactive web viewer for inference visualization, metric evaluation, and generation of new test data
+  - [Further documentation](ViewerDocuments_forJSA/viewer.md)
+
+- Running the end-to-end pipeline, from dataset generation to launching the web viewer
+  - `run_all.sh`

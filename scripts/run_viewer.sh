@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Optional public sharing/auth:
-#   GRADIO_SHARE=1 GRADIO_AUTH_USER=demo GRADIO_AUTH_PASS='strong_password' ./scripts/run_viewer_jsa_family.sh
+#   GRADIO_SHARE=1 GRADIO_AUTH_USER=demo GRADIO_AUTH_PASS='strong_password' ./scripts/run_viewer.sh
 SHARE_ARGS=()
 if [[ "${GRADIO_SHARE:-0}" == "1" ]]; then
   SHARE_ARGS+=(--share)
