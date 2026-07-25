@@ -3,3 +3,4 @@ codes/__pycache__
 profiles/*
 scene/*
 *.exr
+benchmark_results/*
