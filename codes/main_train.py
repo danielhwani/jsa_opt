@@ -285,24 +285,29 @@ def main():
             option.save_checkpoint(config["task"], checkpoint_dir, net, optimizer,epoch,current_iter)
             
             # evaluate network
-            Loss_average, PSNR_average = eval.eval_train(net, test_loader, epoch)
+            # NOTE: full-resolution (non-patched) eval forward pass OOMs on 4GB VRAM GPUs.
+            # Skipped for this low-VRAM pipeline validation pass via config["run_eval"];
+            # re-enable once eval is patch-based or run on higher-VRAM hardware.
+            if config.get("run_eval", True):
+                torch.cuda.empty_cache()
+                Loss_average, PSNR_average = eval.eval_train(net, test_loader, epoch)
 
-            # log eval info of average value
-            if config['timezone'] == None:
-                str_data_eval = datetime.datetime.now().astimezone(None).strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                str_data_eval = datetime.datetime.now().astimezone(timezone(config["timezone"])).strftime("%Y-%m-%d %H:%M:%S")
+                # log eval info of average value
+                if config['timezone'] == None:
+                    str_data_eval = datetime.datetime.now().astimezone(None).strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    str_data_eval = datetime.datetime.now().astimezone(timezone(config["timezone"])).strftime("%Y-%m-%d %H:%M:%S")
 
-            str_print_evalutation = "[Epoch %03d / %03d] [Iter %06d] (%s) rel l2 Loss avg: %0.6f   PSNR avg: %0.6f\n" %(epoch, max_epoch, current_iter, str_data_eval, Loss_average, PSNR_average)
-            print(str_print_evalutation)
-            logfile_validation.write(str_print_evalutation)
-            logfile_validation.flush()
+                str_print_evalutation = "[Epoch %03d / %03d] [Iter %06d] (%s) rel l2 Loss avg: %0.6f   PSNR avg: %0.6f\n" %(epoch, max_epoch, current_iter, str_data_eval, Loss_average, PSNR_average)
+                print(str_print_evalutation)
+                logfile_validation.write(str_print_evalutation)
+                logfile_validation.flush()
 
-            if PSNR_average > PSNR_average_best:
-                PSNR_average_best = PSNR_average
-                epoch_best = epoch
-                iter_best = current_iter
-                option.save_checkpoint_best(config["task"], checkpoint_dir, net, optimizer,epoch_best,iter_best)
+                if PSNR_average > PSNR_average_best:
+                    PSNR_average_best = PSNR_average
+                    epoch_best = epoch
+                    iter_best = current_iter
+                    option.save_checkpoint_best(config["task"], checkpoint_dir, net, optimizer,epoch_best,iter_best)
 
 if __name__ == '__main__':
     main()

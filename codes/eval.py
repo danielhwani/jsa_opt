@@ -51,8 +51,97 @@ def expand2square(timg,factor=16.0):
     # print((X - h)//2, (X - h)//2+h, (X - w)//2, (X - w)//2+w)
     img[:,:, ((X - h)//2):((X - h)//2 + h),((X - w)//2):((X - w)//2 + w)] = timg
     mask[:,:, ((X - h)//2):((X - h)//2 + h),((X - w)//2):((X - w)//2 + w)].fill_(1)
-    
+
     return img, mask
+
+def _cosine_ramp(length):
+    # 0 -> 1 raised-cosine (Hann half-window); two of these mirrored against each
+    # other across an overlap region sum to exactly 1 at every pixel, so blending
+    # neighboring tiles with this window reconstructs a seamless, non-uniform average.
+    if length <= 0:
+        return torch.zeros(0)
+    if length == 1:
+        return torch.ones(1)
+    return 0.5 - 0.5 * torch.cos(torch.linspace(0, math.pi, length))
+
+
+def _axis_weight(size, overlap, is_first, is_last):
+    # full weight (1.0) on edges that touch the true image border (no neighbor to
+    # blend with there); cosine taper only on edges shared with a neighboring tile.
+    w = torch.ones(size)
+    ramp_len = min(overlap, size // 2)
+    if ramp_len > 0:
+        ramp = _cosine_ramp(ramp_len)
+        if not is_first:
+            w[:ramp_len] = ramp
+        if not is_last:
+            w[-ramp_len:] = ramp.flip(0)
+    return w
+
+
+def _tile_starts(size, tile_size, stride):
+    if size <= tile_size:
+        return [0]
+    starts = list(range(0, size - tile_size + 1, stride))
+    if starts[-1] != size - tile_size:
+        starts.append(size - tile_size)
+    return starts
+
+
+def tiled_forward(net, x, y, tile_size, device, overlap=0):
+    # Each tile is forwarded through the full U-Net independently (4x downsample +
+    # win_size=8 window attention hardcoded in main_train.py), so tile_size itself
+    # must be a multiple of 128 or window_partition() crashes inside individual tiles.
+    assert tile_size % 128 == 0, (
+        "eval_tile_size (%d) must be a multiple of 128: the model downsamples 4x "
+        "with win_size=8 window attention, so each independently-forwarded tile "
+        "needs a spatial size that is a multiple of 128." % tile_size
+    )
+    assert 0 <= overlap < tile_size, "eval_tile_overlap must be in [0, tile_size)"
+
+    B, _, H, W = x.shape
+
+    # tiles must fully fit inside the image at least once
+    pad_h = max(0, tile_size - H)
+    pad_w = max(0, tile_size - W)
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, pad_w, 0, pad_h), 'reflect')
+        y = F.pad(y, (0, pad_w, 0, pad_h), 'reflect')
+
+    Hp, Wp = x.shape[2], x.shape[3]
+    stride = tile_size - overlap
+    h_starts = _tile_starts(Hp, tile_size, stride)
+    w_starts = _tile_starts(Wp, tile_size, stride)
+
+    out_sum = None
+    weight_sum = torch.zeros(1, 1, Hp, Wp)
+
+    for i in h_starts:
+        for j in w_starts:
+            tile_x = x[:, :, i:i + tile_size, j:j + tile_size]
+            tile_y = y[:, :, i:i + tile_size, j:j + tile_size]
+
+            with torch.no_grad():
+                tile_out = net(tile_x, tile_y)
+
+            # move off GPU immediately so VRAM doesn't accumulate across tiles
+            tile_out = tile_out.detach().to("cpu")
+            if out_sum is None:
+                out_sum = torch.zeros(B, tile_out.shape[1], Hp, Wp, dtype=tile_out.dtype)
+
+            wh = _axis_weight(tile_size, overlap, i == 0, i == Hp - tile_size)
+            ww = _axis_weight(tile_size, overlap, j == 0, j == Wp - tile_size)
+            weight2d = (wh.unsqueeze(1) * ww.unsqueeze(0)).to(tile_out.dtype)  # [tile_size, tile_size]
+
+            out_sum[:, :, i:i + tile_size, j:j + tile_size] += tile_out * weight2d
+            weight_sum[:, :, i:i + tile_size, j:j + tile_size] += weight2d
+
+            del tile_out, tile_x, tile_y
+            torch.cuda.empty_cache()
+
+    out = out_sum / weight_sum.clamp(min=1e-8)
+    out = out[:, :, :H, :W].to(device)
+    return out
 
 def eval_train(net, test_loader, epoch):
     # evaluate network
@@ -122,14 +211,15 @@ def eval_train(net, test_loader, epoch):
             x = color_noisy.to(device)
             y = aux_features.to(device)
 
-        with torch.no_grad():
-            out = net(x, y)
+        tile_size = config.get("eval_tile_size", config.get("patch_size", 128))
+        tile_overlap = config.get("eval_tile_overlap", 0)
+        out = tiled_forward(net, x, y, tile_size, device, overlap=tile_overlap)
 
         out = out[:,:,:h,:w]
         loss = torch.mean(L.RelL2(out, color_gt_for_loss))
 
         # inverse log transform
-        output_c_n = util_rend.postprocess_specular(out.data.cpu().numpy()[0])        
+        output_c_n = util_rend.postprocess_specular(out.data.cpu().numpy()[0])
         gt_c_n = color_gt.numpy()[0]
 
         noisy_c_n_255  = util_rend.tensor2img(color_noisy.cpu().numpy()[0], post_spec=True)
@@ -138,6 +228,7 @@ def eval_train(net, test_loader, epoch):
 
         # rmse: output after post-processing, without tone mapping and * 255 (use postprocess_specular/ postprocess_diffuse)
         # psnr, ssim: output after post-processing, tone mapping and * 255 (use tensor2img)
+        # metrics are computed on the reconstructed full image (post-stitching), not per-tile
         our_rmse = util_image.calculate_rmse(np.transpose(output_c_n.copy(), (1, 2, 0)), np.transpose(gt_c_n.copy(), (1, 2, 0)))
         our_psnr = util_image.calculate_psnr(output_c_n_255.copy(), gt_c_n_255.copy())
         our_ssim = util_image.calculate_ssim(output_c_n_255.copy(), gt_c_n_255.copy())
@@ -261,15 +352,17 @@ def eval_test(net, test_loader, epoch):
         # end_time = time.time() - start_time
 
         # new
+        tile_size = config.get("eval_tile_size", config.get("patch_size", 128))
+        tile_overlap = config.get("eval_tile_overlap", 0)
+
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
         torch.cuda.synchronize(device)
 
-        with torch.no_grad():
-            start_event.record()
-            out = net(x, y)
-            end_event.record()
+        start_event.record()
+        out = tiled_forward(net, x, y, tile_size, device, overlap=tile_overlap)
+        end_event.record()
 
         end_event.synchronize()
         end_time = start_event.elapsed_time(end_event) * 1e-3  # seconds

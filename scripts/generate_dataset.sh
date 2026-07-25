@@ -6,21 +6,21 @@ cd "$PROJECT_ROOT"
 
 ARGS=(
   --scene classroom/classroom.xml                 # scene file path
-  --name classroom_overfit_jsa_1024               # dataset name
+  --name classroom_overfit_jsa_512                # dataset name
   --out-data "$PROJECT_ROOT/data"                 # output data root
 
   --variant cuda_ad_rgb                           # GPU rendering
 
-  --width 1024                                    # output width
-  --height 1024                                   # output height
+  --width 512                                     # output width
+  --height 512                                    # output height
 
-  --num-views 8                                   # number of overfit views
+  --num-views 2                                   # number of overfit views
 
   --input-spp 4                                   # noisy RGB input spp
   --aov-spp 4                                     # AOV / feature spp
 
-  --ref-spp 51200                                 # GT reference spp
-  --ref-chunk-spp 1024                             # chunk size for ETA/progress
+  --ref-spp 4096                                  # GT reference spp
+  --ref-chunk-spp 512                              # chunk size for ETA/progress
 
   --camera-mode fixed                             # fixed base camera with jitter
   --base-origin -1.69049 1.27158 5.88653          # base camera origin (m03, m13, m23 of the camera matrix)

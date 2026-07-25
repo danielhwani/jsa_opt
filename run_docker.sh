@@ -6,5 +6,5 @@ docker run \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -p 7860:7860 \
   -v "${PWD}:/workspace" \
-  --shm-size=32G \
+  --shm-size=8G \
   -it joint_sa

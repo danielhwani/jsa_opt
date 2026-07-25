@@ -51,7 +51,7 @@ RUN pip install mitsuba gradio pillow imageio
 RUN git clone --depth=1 https://github.com/NVIDIA-AI-IOT/torch2trt /opt/torch2trt && \
     cd /opt/torch2trt && \
     python setup.py install
-    
+
 RUN apt-get update && apt-get install -y sudo
 
 WORKDIR /opt
