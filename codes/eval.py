@@ -25,7 +25,7 @@
 
 import torch
 import os
-from config import config
+from config import config as _default_config
 import utils.utils_image as util_image
 import utils.utils_rend_img as util_rend
 from pytz import timezone
@@ -143,7 +143,7 @@ def tiled_forward(net, x, y, tile_size, device, overlap=0):
     out = out[:, :, :H, :W].to(device)
     return out
 
-def eval_train(net, test_loader, epoch):
+def eval_train(net, test_loader, epoch, config=_default_config):
     # evaluate network
     net.eval()
     test_cnt = 0
@@ -270,7 +270,7 @@ def eval_train(net, test_loader, epoch):
 
     return Loss_average, PSNR_average
 
-def eval_test(net, test_loader, epoch):
+def eval_test(net, test_loader, epoch, config=_default_config):
     # evaluate network
     net.eval()
     test_cnt = 0

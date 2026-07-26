@@ -36,3 +36,6 @@ This directory contains scripts for:
 
 - Running the end-to-end pipeline, from dataset generation to launching the web viewer
     - `run_all.sh`
+
+- Manually reproducing the GTX 1650 (4GB) lightweight-port workflow (training, TensorRT benchmarking, image/metric comparison) step by step in a terminal
+    - [Further documentation](MANUAL_GUIDE.md)

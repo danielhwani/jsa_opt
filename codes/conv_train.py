@@ -286,7 +286,7 @@ def main():
             option.save_checkpoint(config["task"], checkpoint_dir, net, optimizer,epoch,current_iter)
             
             # evaluate network
-            Loss_average, PSNR_average = eval.eval_train(net, test_loader, epoch)
+            Loss_average, PSNR_average = eval.eval_train(net, test_loader, epoch, config=config)
 
             # log eval info of average value
             if config['timezone'] == None:

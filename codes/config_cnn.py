@@ -40,13 +40,13 @@ else:
 # for test using pre-trained checkpoint
 config["multi_gpu"]  = False    
 
-config["dataloader_numworker"] = 8
+config["dataloader_numworker"] = 2
 
 # =======================================
 # Dataset
 # =======================================
 config["DataDirectory"] = "/workspace/data"
-config["trainDatasetDirectory"] = "/workspace/data/__train_scenes__/classroom_overfit_jsa_1024"
+config["trainDatasetDirectory"] = "/workspace/data/__train_scenes__/classroom_overfit_jsa_512"
 
 config["train_input"] = 'input'
 config["train_target"] = 'target'
@@ -55,7 +55,7 @@ config["train_target"] = 'target'
 # =======================================
 # Dataset
 # =======================================
-config["testDatasetDirectory"] = "/workspace/data/__test_scenes__/classroom_overfit_jsa_1024"
+config["testDatasetDirectory"] = "/workspace/data/__test_scenes__/classroom_overfit_jsa_512"
 
 config["test_input"] = 'input' 
 config["test_target"] = 'target'
@@ -90,17 +90,22 @@ config["weight_decay"] = 0.001               # weight decay
 config["wramup"] = True
 config["warmup_epochs"] = 5
 
-config["patch_size"] = 128                                  
-config["patch_stride_size"] = config["patch_size"]   # default           
+config["patch_size"] = 128
+config["patch_stride_size"] = config["patch_size"]   # default
 config["patch_based_learning"] = True
-config["batch_size"] = 1                   # adjust to GPU memory size 
+config["batch_size"] = 1                   # adjust to GPU memory size
 
-config["shuffle_file_list"] = True                      
+# tile size for sliding-window eval (must be a multiple of 128; see eval.tiled_forward)
+config["eval_tile_size"] = config["patch_size"]
+# overlap (px) between neighboring eval tiles, cosine-blended to hide seams
+config["eval_tile_overlap"] = 24
+
+config["shuffle_file_list"] = True
 config["dataloader_shuffle"] = True
-config["aug_mode"] = False # to see overfitting, set False                                   
+config["aug_mode"] = False # to see overfitting, set False
 
-config["max_epoch"] = 5000                  # the max epoch for training
-config["snapshot"] = 1000 
+config["max_epoch"] = 100                  # the max epoch for training
+config["snapshot"] = 20
 
 # config["retrain"] = True
 config["retrain"] = False
@@ -109,7 +114,7 @@ config["restore_epoch"] = 50
 # =======================================
 # Test parameter
 # =======================================
-config["load_epoch"] = "5000" #'jsa_pretrained'
+config["load_epoch"] = "best" #'jsa_pretrained'
 
 
 
