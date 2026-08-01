@@ -25,7 +25,7 @@ ARGS=(
   --camera-mode fixed                               # fixed base camera with jitter
   --base-origin 6.91182 1.65163 2.55414             # base camera origin (from scene sensor matrix)
   --base-target 6.011643 1.651629953 2.118617       # base camera target (origin + forward)
-  --base-up -4.21474e-08 1 -2.03917e-08             # Y-up camera up vector
+  --base-up 0.0 1.0 0.0                             # Y-up camera up vector
   --base-fov 70
 
   --origin-jitter 0.00                              # camera origin perturbation

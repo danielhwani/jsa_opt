@@ -159,3 +159,82 @@ bash scripts/compare_conv.sh --view-index 0
 | JSA TensorRT 엔진/결과 | `benchmark_results/engine/jsa_torch2trt_exportpatch_fp16_1x3x128x128.*` |
 | JSA+Conv TensorRT 엔진/결과 | `benchmark_results/engine/jsa_conv_torch2trt_exportpatch_fp16_1x3x128x128.*` |
 | 이미지/지표 비교 결과 | `outputs/inference_classroom/` |
+| staircase2 데이터셋 (input/target) | `data/__train_scenes__/staircase2_overfit_jsa/`, `data/__test_scenes__/staircase2_overfit_jsa/` |
+
+## 6. 새 씬으로 데이터셋 생성하기 (예: staircase2)
+
+`classroom` 말고 다른 씬으로 데이터셋을 만들고 싶을 때의 절차입니다.
+`scenes/staircase2/`가 그 예시로 이미 포함되어 있습니다
+([Benedikt Bitterli's Rendering Resources](https://benedikt-bitterli.me/resources/)의
+Mitsuba 3 호환 씬, CC-BY 라이선스).
+
+### 6-1. 씬 준비
+
+자기완결적인 Mitsuba 3 XML 씬(`version="3.0.0"`, 자체 `models/`, `textures/` 포함)을
+`scenes/<name>/<name>.xml` 형태로 저장소에 배치합니다.
+
+### 6-2. 카메라 파라미터 추출
+
+씬 XML의 `<sensor><transform name="to_world"><matrix value="..."/>`에서 4x4 행렬을 뽑아
+origin(마지막 열)/up(2번째 열)/forward(3번째 열)/fov를 계산합니다:
+
+```python
+import numpy as np
+vals = [float(v) for v in "<matrix value 16개 숫자>".split()]
+M = np.array(vals).reshape(4, 4)
+origin = M[:3, 3]
+up = M[:3, 1]
+target = origin + M[:3, 2]   # origin + forward
+```
+
+> **주의**: `up`/`forward` 성분이 `-4.21474e-08`처럼 과학적 표기법 음수로 나오면
+> `--base-up` 같은 `nargs=3` 인자에 그대로 넣지 마세요. Python argparse의 음수
+> 판별 정규식(`^-\d+$|^-\d*\.\d+$`)이 `e-08` 표기를 못 알아봐서 옵션 플래그로
+> 오인해 `error: expected 3 arguments`로 실패합니다. 이런 값은 사실상 0이므로
+> `0.0`으로 반올림해서 넣으면 됩니다 (staircase2도 이 문제를 겪어서 up을
+> `0.0 1.0 0.0`으로 고쳤습니다).
+
+### 6-3. 생성 스크립트 작성
+
+`scripts/generate_dataset.sh`를 복사해서 `--scene`/`--name`/카메라 파라미터만
+바꾼 `scripts/generate_dataset_<name>.sh`를 만듭니다. `scripts/generate_dataset_staircase2.sh`는
+해상도/뷰수/spp를 환경변수로 오버라이드할 수 있게 되어 있어, 저해상도 스모크
+테스트와 풀 해상도 본 생성에 같은 스크립트를 재사용합니다:
+
+```bash
+# GPU 초기화만 빠르게 확인하는 스모크 테스트
+WIDTH=128 HEIGHT=128 NUM_VIEWS=1 INPUT_SPP=1 AOV_SPP=1 REF_SPP=64 \
+  bash scripts/generate_dataset_staircase2.sh
+
+# 풀 해상도 (기본값: 512x512, 2 views, input/aov 4spp, ref 4096spp)
+bash scripts/generate_dataset_staircase2.sh
+```
+
+### 6-4. 안전 모드로 실행 (2절과 동일한 패턴)
+
+```bash
+docker run -d --name staircase2_gen \
+  --gpus all \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e PYTHONUNBUFFERED=1 \
+  --memory=6g --memory-swap=6g --shm-size=2g \
+  -v "$(pwd):/workspace" -w /workspace \
+  joint_sa \
+  bash scripts/generate_dataset_staircase2.sh
+
+docker logs -f staircase2_gen     # 실시간 로그 (input+aov, ref chunk 진행률)
+docker wait staircase2_gen        # 종료 코드 대기
+docker rm staircase2_gen          # 정리
+```
+
+`ref-spp=4096`는 `--ref-chunk-spp`(기본 512) 단위로 청크 렌더링되며 각 청크마다
+`elapsed`/`eta`가 로그로 출력됩니다. 512×512 기준 뷰당 GT 렌더링에 약 2.5~3분이
+걸리고 그 사이 로그가 19초 간격으로 나오므로, 그보다 오래 조용하면 3절의
+`nvidia-smi`/`docker stats`로 실제 진행 여부를 확인하세요.
+
+결과는 `data/__train_scenes__/<name>/`, `data/__test_scenes__/<name>/`에
+`input`/`target` EXR + `input_npz`(`color`+`aux` 7채널: albedo 3 + depth 1 + normal 3)
+/`target_npz`로 저장되고, 마지막에 `config["task"]`/`trainDatasetDirectory`/
+`testDatasetDirectory` 값이 콘솔에 출력됩니다 — 이 값을 `config.py`/`config_cnn.py`에
+반영하면 새 씬으로 바로 학습할 수 있습니다.
