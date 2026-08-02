@@ -45,3 +45,6 @@ This directory contains scripts for:
 
 - Manually reproducing the GTX 1650 (4GB) lightweight-port workflow (training, TensorRT benchmarking, image/metric comparison) step by step in a terminal
     - [Further documentation](MANUAL_GUIDE.md)
+
+- Understanding the `JSA_transformer` model architecture (the dual-branch, U-shaped window transformer in `codes/model/model_joint_sa.py`)
+    - [Further documentation](codes/model/ARCHITECTURE.md)
